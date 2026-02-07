@@ -135,7 +135,7 @@ const WHISPER_PROMPT: &str = "\
 Git, Docker, API, React, TypeScript, npm, config, Claude, Whisper, Claude Code, Gitea, Dokploy, \
 CI/CD, GitHub Actions, Nginx, Traefik, SSH, YAML, Kubernetes, Helm, LLM, GPT, Gemini, OpenRouter, Anthropic, \
 embeddings, RAG, fine-tuning, tokens, prompt, Node.js, Bun, pnpm, ESLint, Prettier, Vite, Next.js, \
-Prisma, PostgreSQL, Redis, JSON, REST, GraphQL, WebSocket, OAuth, JWT, regex, localhost, endpoint, webhook, cron, tmux, worktree, баг-репорт.";
+Prisma, PostgreSQL, Redis, JSON, REST, GraphQL, WebSocket, OAuth, JWT, regex, localhost, endpoint, webhook, cron, tmux, worktree, subagent, баг-репорт.";
 
 /// Prompt for GPT-4o transcription API - can use LLM-style instructions
 /// Supports auto-detection between Russian and English (configurable via VOICE_KEYBOARD_LANGUAGES)
@@ -145,7 +145,7 @@ const OPENAI_PROMPT_TEMPLATE: &str = "\
 IT-термины оставляй на английском: Git, Docker, API, React, TypeScript, npm, config, Claude, Whisper, Claude Code, Gitea, Dokploy, \
 CI/CD, GitHub Actions, Nginx, Traefik, SSH, YAML, Kubernetes, Helm, LLM, GPT, Gemini, OpenRouter, Anthropic, \
 embeddings, RAG, fine-tuning, tokens, prompt, Node.js, Bun, pnpm, ESLint, Prettier, Vite, Next.js, \
-Prisma, PostgreSQL, Redis, JSON, REST, GraphQL, WebSocket, OAuth, JWT, regex, localhost, endpoint, webhook, cron, tmux, worktree, баг-репорт. \
+Prisma, PostgreSQL, Redis, JSON, REST, GraphQL, WebSocket, OAuth, JWT, regex, localhost, endpoint, webhook, cron, tmux, worktree, subagent, баг-репорт. \
 КРИТИЧЕСКИ ВАЖНО: Распознавай ТОЛЬКО реально слышимое в аудио. \
 НИКОГДА не повторяй текст из контекста — контекст только для понимания темы. \
 Если аудио содержит АБСОЛЮТНУЮ тишину без единого произнесённого слова — ответь ровно одним символом: - \
@@ -1853,7 +1853,7 @@ RULES:
 - Preserve original meaning, tone, and structure
 - Keep questions as questions, exclamations as exclamations
 - Maintain paragraph breaks
-- IT terms stay in English: Git, Docker, API, Claude
+- IT terms stay in English: Git, Docker, API, Claude, subagent
 - Just translate, no formatting changes, no additions
 - Output ONLY the translation, nothing else";
 
