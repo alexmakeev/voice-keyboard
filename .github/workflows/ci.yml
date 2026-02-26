@@ -15,7 +15,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-14, windows-latest]
+        include:
+          - os: ubuntu-22.04
+            features: "whisper"
+          - os: macos-14
+            features: "whisper,metal"
+          - os: macos-15
+            features: "whisper"
+          - os: windows-latest
+            features: "whisper"
 
     runs-on: ${{ matrix.os }}
 
@@ -41,15 +49,28 @@ jobs:
             pkg-config
 
       - name: Check
-        run: cargo check --bin voice-typer --features whisper
+        run: cargo check --bin voice-typer --features "${{ matrix.features }}"
 
       - name: Check formatting
         run: cargo fmt --check
         continue-on-error: true
 
       - name: Clippy
-        run: cargo clippy --bin voice-typer --features whisper -- -D warnings
+        run: cargo clippy --bin voice-typer --features "${{ matrix.features }}" -- -D warnings
         continue-on-error: true
+
+      - name: Check version consistency
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          ROOT_VER=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          TAURI_CARGO_VER=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          TAURI_CONF_VER=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          echo "Root: $ROOT_VER, Tauri Cargo: $TAURI_CARGO_VER, Tauri conf: $TAURI_CONF_VER"
+          if [ "$ROOT_VER" != "$TAURI_CARGO_VER" ] || [ "$ROOT_VER" != "$TAURI_CONF_VER" ]; then
+            echo "ERROR: Version mismatch! All versions must match."
+            exit 1
+          fi
+          echo "Versions are consistent: $ROOT_VER"
 
   # Build and test on all platforms
   build-and-test:
@@ -59,12 +80,16 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            features: "whisper"
           - os: macos-14
             target: aarch64-apple-darwin
+            features: "whisper,metal"
           - os: macos-15
             target: x86_64-apple-darwin
+            features: "whisper"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            features: "whisper"
 
     runs-on: ${{ matrix.os }}
 
@@ -97,10 +122,10 @@ jobs:
         env:
           CFLAGS: ${{ startsWith(matrix.target, 'aarch64') && '-march=armv8-a+dotprod' || '' }}
           CXXFLAGS: ${{ startsWith(matrix.target, 'aarch64') && '-march=armv8-a+dotprod' || '' }}
-        run: cargo build --release --bin voice-typer --features whisper --target ${{ matrix.target }}
+        run: cargo build --release --bin voice-typer --features "${{ matrix.features }}" --target ${{ matrix.target }}
 
       - name: Run unit tests
-        run: cargo test --features whisper --target ${{ matrix.target }}
+        run: cargo test --features "${{ matrix.features }}" --target ${{ matrix.target }}
         continue-on-error: true
 
       - name: Test binary runs
@@ -112,20 +137,44 @@ jobs:
             ./target/${{ matrix.target }}/release/voice-typer --help
           fi
 
-  # Integration test with audio file (Linux only - has audio processing)
+  # Integration test with Whisper model (Linux + macOS)
   integration-test:
-    runs-on: ubuntu-22.04
+    needs: [check]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            features: "whisper"
+          - os: macos-14
+            target: aarch64-apple-darwin
+            features: "whisper,metal"
+          - os: macos-15
+            target: x86_64-apple-darwin
+            features: "whisper"
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      CI_REQUIRE_MODEL: "1"
+      MODEL_PATH: ./models/ggml-tiny.bin
 
     steps:
       - uses: actions/checkout@v6
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-integration
 
-      - name: Install dependencies
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -134,45 +183,88 @@ jobs:
             libx11-dev \
             libxtst-dev \
             libevdev-dev \
-            pkg-config \
-            ffmpeg
+            pkg-config
+
+      - name: Cache Whisper model
+        uses: actions/cache@v4
+        with:
+          path: models/ggml-tiny.bin
+          key: whisper-model-tiny-v1
+
+      - name: Download tiny Whisper model
+        run: |
+          if [ ! -f models/ggml-tiny.bin ]; then
+            mkdir -p models
+            curl -L -o models/ggml-tiny.bin \
+              https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin
+          fi
 
       - name: Build
-        run: cargo build --release --bin voice-typer --features whisper
+        run: cargo build --release --bin voice-typer --features "${{ matrix.features }}" --target ${{ matrix.target }}
 
-      - name: Download tiny model for testing
-        run: |
-          mkdir -p ~/.local/share/voice-keyboard/models
-          curl -L -o ~/.local/share/voice-keyboard/models/ggml-tiny.bin \
-            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin
-
-      - name: Download test audio files
-        run: |
-          mkdir -p test_audio
-
-          # Download Russian speech sample from Mozilla Common Voice or similar
-          # Using a known public domain audio sample
-          curl -L -o test_audio/russian_sample.mp3 \
-            "https://upload.wikimedia.org/wikipedia/commons/4/4e/Russian_word_for_hello.ogg" || true
-
-          # Convert to WAV if ffmpeg available
-          if [ -f test_audio/russian_sample.mp3 ]; then
-            ffmpeg -i test_audio/russian_sample.mp3 -ar 16000 -ac 1 test_audio/russian_sample.wav || true
-          fi
-
-      - name: Test transcription (if audio available)
-        run: |
-          if [ -f test_audio/russian_sample.wav ]; then
-            echo "Testing transcription..."
-            # Create a simple test that loads model and verifies it works
-            ./target/release/voice-typer --help
-            echo "Voice-typer binary works!"
-          else
-            echo "No test audio available, skipping transcription test"
-          fi
+      - name: Run integration tests
+        run: cargo test --test whisper_test --features "${{ matrix.features }}" --target ${{ matrix.target }} -- --nocapture
 
       - name: Verify model loads
+        shell: bash
         run: |
           # Quick test that model can be loaded (will fail on hotkey, but that's OK)
-          timeout 5 ./target/release/voice-typer --model tiny 2>&1 | head -20 || true
+          timeout 5 ./target/${{ matrix.target }}/release/voice-typer --model tiny 2>&1 | head -20 || true
           echo "Model loading test completed"
+
+  # Build Tauri app for macOS
+  build-tauri-macos:
+    needs: [check]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            features: "whisper,metal"
+          - os: macos-15
+            target: x86_64-apple-darwin
+            features: "whisper"
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo-tauri-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-cargo-tauri-
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build voice-typer binary
+        run: cargo build --release --bin voice-typer --features "${{ matrix.features }}" --target ${{ matrix.target }}
+
+      - name: Prepare sidecar binary
+        run: |
+          mkdir -p src-tauri/binaries
+          cp target/${{ matrix.target }}/release/voice-typer src-tauri/binaries/voice-typer-${{ matrix.target }}
+
+      - name: Build Tauri app
+        run: cargo tauri build --target ${{ matrix.target }} --bundles dmg
+        env:
+          APPLE_SIGNING_IDENTITY: ""
+          CI: true
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-dmg-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/bundle/dmg/*.dmg
