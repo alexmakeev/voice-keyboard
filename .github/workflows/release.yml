@@ -293,7 +293,7 @@ jobs:
       - name: Build Tauri DMG
         run: cargo tauri build --target ${{ matrix.target }} --bundles dmg
         env:
-          APPLE_SIGNING_IDENTITY: ""
+          APPLE_SIGNING_IDENTITY: "-"
           CI: true
 
       - name: Rename DMG
