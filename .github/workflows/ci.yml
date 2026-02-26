@@ -20,7 +20,7 @@ jobs:
             features: "whisper"
           - os: macos-14
             features: "whisper,metal"
-          - os: macos-15
+          - os: macos-13
             features: "whisper"
           - os: windows-latest
             features: "whisper"
@@ -84,7 +84,7 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             features: "whisper,metal"
-          - os: macos-15
+          - os: macos-13
             target: x86_64-apple-darwin
             features: "whisper"
           - os: windows-latest
@@ -150,7 +150,7 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             features: "whisper,metal"
-          - os: macos-15
+          - os: macos-13
             target: x86_64-apple-darwin
             features: "whisper"
 
@@ -222,7 +222,7 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             features: "whisper,metal"
-          - os: macos-15
+          - os: macos-13
             target: x86_64-apple-darwin
             features: "whisper"
 
