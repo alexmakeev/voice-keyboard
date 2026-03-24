@@ -17,10 +17,31 @@ use tauri::{
     tray::TrayIconBuilder,
     Emitter,
 };
+#[cfg(not(target_os = "macos"))]
+use tauri::tray::{MouseButton, TrayIconEvent};
 
 mod audio;
 mod whisper;
 mod debug_log;
+
+/// Information about a software update
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateInfo {
+    pub current_version: String,
+    pub latest_version: String,
+    /// Alias for latest_version — frontend uses both `version` and `latest_version`
+    pub version: String,
+    pub update_available: bool,
+    pub release_url: String,
+    pub download_url: String,
+    /// Download URL for SHA256SUMS.txt (None if not found in release)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checksums_url: Option<String>,
+    /// Filename of the download asset (for matching in SHA256SUMS.txt)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_filename: Option<String>,
+    pub last_check: String,
+}
 
 // macOS permission check APIs
 #[cfg(target_os = "macos")]
@@ -56,6 +77,8 @@ struct AppState {
     voice_typer: Arc<Mutex<Option<Child>>>,
     /// Last known status (for polling from frontend)
     last_status: Arc<Mutex<serde_json::Value>>,
+    /// Cached update info from last check
+    update_info: Arc<Mutex<Option<UpdateInfo>>>,
 }
 
 /// A single debug log line with category info
@@ -143,6 +166,7 @@ pub struct LanguageOption {
     pub native_name: String,
 }
 
+/// Return the list of languages supported by Whisper (shown in the settings UI)
 fn get_available_languages() -> Vec<LanguageOption> {
     vec![
         LanguageOption { code: "en".into(), name: "English".into(), native_name: "English".into() },
@@ -679,9 +703,683 @@ fn open_privacy_settings() -> Result<(), String> {
 }
 
 // ============================================================================
+// Update check
+// ============================================================================
+
+/// Fetch GitHub releases API and return update info
+async fn do_update_check(current_version: &str) -> Result<UpdateInfo, String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client
+        .get("https://api.github.com/repos/alexmakeev/voice-keyboard/releases/latest")
+        .header("User-Agent", "voice-keyboard-app")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !response.status().is_success() {
+        return Err(format!("GitHub API returned HTTP {}", response.status()));
+    }
+
+    let body = response.text().await.map_err(|e| e.to_string())?;
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+
+    let tag_name = json["tag_name"]
+        .as_str()
+        .ok_or_else(|| "Missing tag_name in response".to_string())?;
+
+    let latest_version = tag_name.trim_start_matches('v').to_string();
+
+    let html_url = json["html_url"].as_str().unwrap_or("").to_string();
+
+    // Find platform-specific asset download URL, checksums URL, and asset filename.
+    // found_url starts empty — if no platform asset is found, download_url stays empty
+    // so the UI can show "new version available" but disable the Install button.
+    let (download_url, checksums_url, asset_filename) = {
+        let mut found_url = String::new();
+        let mut found_checksums_url: Option<String> = None;
+        let mut found_asset_name: Option<String> = None;
+
+        if let Some(assets) = json["assets"].as_array() {
+            // First pass: find the SHA256SUMS.txt asset
+            for asset in assets {
+                let name = asset["name"].as_str().unwrap_or("");
+                if name == "SHA256SUMS.txt" {
+                    if let Some(url) = asset["browser_download_url"].as_str() {
+                        found_checksums_url = Some(url.to_string());
+                    }
+                    break;
+                }
+            }
+
+            // Second pass: find the platform-specific installer asset
+            for asset in assets {
+                let name = asset["name"].as_str().unwrap_or("");
+                let browser_url = asset["browser_download_url"].as_str().unwrap_or("");
+
+                #[cfg(target_os = "macos")]
+                if name.ends_with(".dmg") {
+                    found_url = browser_url.to_string();
+                    found_asset_name = Some(name.to_string());
+                    break;
+                }
+
+                #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+                if name.contains("x64-setup.exe") {
+                    found_url = browser_url.to_string();
+                    found_asset_name = Some(name.to_string());
+                    break;
+                }
+
+                #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+                if name.contains("arm64-setup.exe") {
+                    found_url = browser_url.to_string();
+                    found_asset_name = Some(name.to_string());
+                    break;
+                }
+
+                #[cfg(target_os = "linux")]
+                if name.ends_with(".AppImage")
+                    || name.ends_with(".deb")
+                    || name.ends_with(".tar.gz")
+                {
+                    found_url = browser_url.to_string();
+                    found_asset_name = Some(name.to_string());
+                    break;
+                }
+            }
+        }
+        (found_url, found_checksums_url, found_asset_name)
+    };
+
+    let current_ver = semver::Version::parse(current_version)
+        .map_err(|e| format!("Invalid current version '{}': {}", current_version, e))?;
+    let latest_ver = semver::Version::parse(&latest_version)
+        .map_err(|e| format!("Invalid latest version '{}': {}", latest_version, e))?;
+
+    let update_available = latest_ver > current_ver;
+    let last_check = chrono::Utc::now().to_rfc3339();
+
+    Ok(UpdateInfo {
+        current_version: current_version.to_string(),
+        version: latest_version.clone(),
+        latest_version,
+        update_available,
+        release_url: html_url,
+        download_url,
+        checksums_url,
+        asset_filename,
+        last_check,
+    })
+}
+
+/// Get current version and cached update info
+#[tauri::command]
+async fn get_version_info(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let current_version = env!("APP_VERSION").to_string();
+    let update_info = state.update_info.lock().unwrap().clone();
+    Ok(serde_json::json!({
+        "current_version": current_version,
+        "update_info": update_info,
+    }))
+}
+
+/// Perform an update check and cache the result
+#[tauri::command]
+async fn check_for_update(state: State<'_, AppState>) -> Result<UpdateInfo, String> {
+    let current_version = env!("APP_VERSION");
+    let info = do_update_check(current_version).await?;
+    *state.update_info.lock().unwrap() = Some(info.clone());
+    Ok(info)
+}
+
+/// Download and install an update, then relaunch the app.
+/// Reads download URLs from cached UpdateInfo in AppState (populated by check_for_update).
+/// Does NOT accept URLs from the frontend to prevent XSS/injection attacks.
+#[tauri::command]
+async fn install_update(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    let info = state
+        .update_info
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("No cached update info. Run check_for_update first.".to_string())?;
+
+    let download_url = info.download_url;
+    let checksums_url = info.checksums_url;
+    let asset_filename = info.asset_filename;
+
+    if download_url.is_empty() {
+        return Err("No download URL available for this platform. Please download manually from the release page.".to_string());
+    }
+
+    tracing::info!("[update] install_update: downloading from {}", download_url);
+
+    #[cfg(target_os = "macos")]
+    {
+        install_update_macos(download_url, checksums_url, asset_filename, app_handle).await
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        install_update_windows(download_url, checksums_url, asset_filename, app_handle).await
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (download_url, checksums_url, asset_filename, app_handle);
+        Err("Auto-update is not supported on this platform".to_string())
+    }
+}
+
+/// Download a file from URL to a local path
+async fn download_update_file(url: &str, dest: &std::path::Path) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Download failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("Download HTTP error: {}", response.status()));
+    }
+
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .map_err(|e| format!("Failed to create file: {}", e))?;
+
+    while let Some(chunk) = response.chunk().await.map_err(|e| format!("Failed to read download chunk: {}", e))? {
+        file.write_all(&chunk).await.map_err(|e| format!("Failed to write chunk to disk: {}", e))?;
+    }
+    file.flush().await.map_err(|e| format!("Failed to flush file: {}", e))?;
+
+    tracing::info!("[update] Downloaded to {}", dest.display());
+    Ok(())
+}
+
+/// Download SHA256SUMS.txt and extract the expected hash for a given asset filename.
+/// Fail-close: if checksums are unavailable or download fails, returns an error.
+/// Unverified installs are not allowed.
+async fn fetch_expected_checksum(
+    checksums_url: Option<&str>,
+    asset_filename: Option<&str>,
+) -> Result<String, String> {
+    let (url, filename) = match (checksums_url, asset_filename) {
+        (Some(u), Some(f)) => (u, f),
+        _ => {
+            return Err(
+                "Checksum verification required but no checksums URL or asset filename available. \
+                 Cannot install unverified update.".to_string()
+            );
+        }
+    };
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client
+        .get(url)
+        .header("User-Agent", "voice-keyboard-app")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to download SHA256SUMS.txt: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "SHA256SUMS.txt download failed with HTTP {}. Cannot install unverified update.",
+            response.status()
+        ));
+    }
+
+    let body = response.text().await.map_err(|e| format!("Failed to read SHA256SUMS.txt: {}", e))?;
+
+    parse_checksum_for_file(&body, filename)
+}
+
+/// Parse SHA256SUMS.txt content and find the hash for a specific filename.
+/// Format: `<hash>  <filename>` (two spaces between hash and name).
+fn parse_checksum_for_file(checksums_content: &str, filename: &str) -> Result<String, String> {
+    for line in checksums_content.lines() {
+        // Standard format: "<64-char-hex>  <filename>" (two spaces)
+        // Also handle single space for robustness
+        let parts: Vec<&str> = line.splitn(2, char::is_whitespace).collect();
+        if parts.len() == 2 {
+            let hash = parts[0].trim();
+            let name = parts[1].trim();
+            if name == filename {
+                return Ok(hash.to_lowercase());
+            }
+        }
+    }
+
+    Err(format!(
+        "Asset '{}' not found in SHA256SUMS.txt",
+        filename
+    ))
+}
+
+/// Compute SHA256 hash of a file on disk and compare against expected hash.
+/// Deletes the file if the checksum does not match.
+fn verify_file_checksum(file_path: &std::path::Path, expected_hash: &str) -> Result<(), String> {
+    use sha2::{Sha256, Digest};
+
+    let mut file = File::open(file_path)
+        .map_err(|e| format!("Failed to open file for checksum: {}", e))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .map_err(|e| format!("Failed to read file for checksum: {}", e))?;
+    let actual_hash = format!("{:x}", hasher.finalize());
+
+    if actual_hash != expected_hash {
+        let _ = fs::remove_file(file_path);
+        return Err(format!(
+            "Checksum verification failed for {}: expected {}, got {}",
+            file_path.display(),
+            expected_hash,
+            actual_hash
+        ));
+    }
+
+    tracing::info!("[update] Checksum verified: {}", file_path.display());
+    Ok(())
+}
+
+/// Download a file and verify its SHA256 checksum against SHA256SUMS.txt from the release.
+/// Checksum verification is mandatory (fail-close). If checksums cannot be fetched or
+/// verified, the download is rejected and the file is deleted.
+async fn download_and_verify(
+    download_url: &str,
+    dest: &std::path::Path,
+    checksums_url: Option<&str>,
+    asset_filename: Option<&str>,
+) -> Result<(), String> {
+    download_update_file(download_url, dest).await?;
+
+    let expected_hash = match fetch_expected_checksum(checksums_url, asset_filename).await {
+        Ok(hash) => hash,
+        Err(e) => {
+            // Clean up the downloaded file since we cannot verify it
+            let _ = fs::remove_file(dest);
+            return Err(e);
+        }
+    };
+
+    verify_file_checksum(dest, &expected_hash)?;
+
+    Ok(())
+}
+
+/// Detect the directory containing the currently running .app bundle.
+/// Falls back to "/Applications" if detection fails.
+#[cfg(target_os = "macos")]
+fn get_current_app_dir() -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        let mut path = exe.as_path();
+        // On macOS, exe is at: /path/to/App.app/Contents/MacOS/binary
+        // Walk up to find the .app bundle, then return its parent directory.
+        while let Some(parent) = path.parent() {
+            if path.extension().map_or(false, |ext| ext == "app") {
+                if let Some(app_dir) = parent.to_str() {
+                    tracing::info!("[update] Detected app directory: {}", app_dir);
+                    return app_dir.to_string();
+                }
+            }
+            path = parent;
+        }
+    }
+    tracing::info!("[update] Could not detect app directory, using /Applications");
+    "/Applications".to_string()
+}
+
+/// Mount a DMG, replace the .app in the detected install directory, unmount and clean up.
+/// Returns the full destination path of the installed app (e.g. "/Applications/Voice Keyboard.app").
+#[cfg(target_os = "macos")]
+fn install_app_from_dmg(dmg_path: &std::path::Path) -> Result<String, String> {
+    // Mount the DMG
+    let attach_output = Command::new("hdiutil")
+        .args(["attach", "-nobrowse", "-noautoopen", dmg_path.to_str().unwrap_or("")])
+        .output()
+        .map_err(|e| {
+            let _ = fs::remove_file(dmg_path);
+            format!("hdiutil attach failed: {}", e)
+        })?;
+
+    if !attach_output.status.success() {
+        let _ = fs::remove_file(dmg_path);
+        let stderr = String::from_utf8_lossy(&attach_output.stderr);
+        return Err(format!("hdiutil attach error: {}", stderr));
+    }
+
+    let attach_stdout = String::from_utf8_lossy(&attach_output.stdout);
+    tracing::info!("[update] hdiutil output: {}", attach_stdout);
+
+    // Parse mount point from last line, last tab-separated column
+    let mount_point = attach_stdout
+        .lines()
+        .last()
+        .and_then(|line| line.split('\t').last())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            let _ = fs::remove_file(dmg_path);
+            "Could not parse mount point from hdiutil output".to_string()
+        })?;
+
+    tracing::info!("[update] Mounted at: {}", mount_point);
+
+    // Helper to clean up on error
+    let cleanup = |mount: &str, dmg: &std::path::Path| {
+        let _ = Command::new("hdiutil").args(["detach", mount]).output();
+        let _ = fs::remove_file(dmg);
+    };
+
+    // Find .app in the mounted volume
+    let app_in_dmg = fs::read_dir(&mount_point)
+        .map_err(|e| {
+            cleanup(&mount_point, dmg_path);
+            format!("Cannot read mounted volume: {}", e)
+        })?
+        .filter_map(|entry| entry.ok())
+        .find(|entry| {
+            entry.path().extension().map(|ext| ext == "app").unwrap_or(false)
+        })
+        .map(|entry| entry.path())
+        .ok_or_else(|| {
+            cleanup(&mount_point, dmg_path);
+            "No .app found in mounted DMG".to_string()
+        })?;
+
+    let new_app_name = app_in_dmg
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Voice Keyboard.app")
+        .to_string();
+
+    tracing::info!("[update] Found app in DMG: {}", new_app_name);
+
+    // Detect the directory where the current app is installed
+    let install_dir = get_current_app_dir();
+
+    // Remove old app from the install directory
+    let old_app_path = format!("{}/Voice Keyboard.app", install_dir);
+    if std::path::Path::new(&old_app_path).exists() {
+        let rm_result = Command::new("rm")
+            .args(["-rf", &old_app_path])
+            .output();
+        match rm_result {
+            Ok(out) if out.status.success() => {
+                tracing::info!("[update] Removed old app: {}", old_app_path);
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                cleanup(&mount_point, dmg_path);
+                return Err(format!("Failed to remove old app: {}", stderr));
+            }
+            Err(e) => {
+                cleanup(&mount_point, dmg_path);
+                return Err(format!("Failed to remove old app: {}", e));
+            }
+        }
+    }
+
+    // Copy .app to the install directory
+    let new_app_dest = format!("{}/{}", install_dir, new_app_name);
+    let cp_result = Command::new("cp")
+        .args(["-R", app_in_dmg.to_str().unwrap_or(""), &new_app_dest])
+        .output();
+
+    match cp_result {
+        Ok(out) if out.status.success() => {
+            tracing::info!("[update] Copied app to {}", new_app_dest);
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            cleanup(&mount_point, dmg_path);
+            return Err(format!(
+                "Failed to copy app to {} (permission denied?): {}",
+                new_app_dest,
+                stderr
+            ));
+        }
+        Err(e) => {
+            cleanup(&mount_point, dmg_path);
+            return Err(format!("cp command failed: {}", e));
+        }
+    }
+
+    // Unmount DMG and clean up temp file
+    let _ = Command::new("hdiutil")
+        .args(["detach", &mount_point])
+        .output();
+    tracing::info!("[update] Unmounted {}", mount_point);
+    let _ = fs::remove_file(dmg_path);
+
+    Ok(new_app_dest)
+}
+
+/// Relaunch the new app and exit the current instance
+#[cfg(target_os = "macos")]
+async fn relaunch_and_exit(app_handle: &tauri::AppHandle, app_dest: &str) {
+    tracing::info!("[update] Launching {}", app_dest);
+    let _ = Command::new("open")
+        .args(["-n", app_dest])
+        .spawn();
+
+    // Short delay to allow open to start before we exit
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    app_handle.exit(0);
+}
+
+/// Download DMG, install the .app bundle and relaunch (macOS-specific update path)
+#[cfg(target_os = "macos")]
+async fn install_update_macos(
+    download_url: String,
+    checksums_url: Option<String>,
+    asset_filename: Option<String>,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    let dmg_name = format!("voice-keyboard-update-{}.dmg", std::process::id());
+    let dmg_path = std::env::temp_dir().join(dmg_name);
+
+    download_and_verify(
+        &download_url,
+        &dmg_path,
+        checksums_url.as_deref(),
+        asset_filename.as_deref(),
+    ).await?;
+
+    let new_app_dest = install_app_from_dmg(&dmg_path)?;
+
+    relaunch_and_exit(&app_handle, &new_app_dest).await;
+
+    Ok(format!("Update installed successfully: {}", new_app_dest))
+}
+
+/// Download installer EXE, verify checksum, launch silent NSIS install and exit (Windows-specific)
+#[cfg(target_os = "windows")]
+async fn install_update_windows(
+    download_url: String,
+    checksums_url: Option<String>,
+    asset_filename: Option<String>,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    let installer_name = format!("voice-keyboard-update-{}.exe", std::process::id());
+    let installer_path = std::env::temp_dir().join(installer_name);
+
+    download_and_verify(
+        &download_url,
+        &installer_path,
+        checksums_url.as_deref(),
+        asset_filename.as_deref(),
+    ).await?;
+
+    // Launch the NSIS installer with /S (silent install)
+    Command::new(&installer_path)
+        .arg("/S")
+        .spawn()
+        .map_err(|e| {
+            let _ = fs::remove_file(&installer_path);
+            format!("Failed to launch installer: {}", e)
+        })?;
+
+    tracing::info!("[update] Installer launched, exiting current instance");
+
+    // Give the installer a moment to start before exiting
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Exit current app so installer can replace files
+    app_handle.exit(0);
+
+    #[allow(unreachable_code)]
+    Ok("Installer launched".to_string())
+}
+
+/// Combined check + install update command with progress events
+#[tauri::command]
+async fn perform_auto_update(state: State<'_, AppState>, app_handle: tauri::AppHandle) -> Result<String, String> {
+    // Get cached update info or do a fresh check.
+    // Clone and drop the lock before any async work to avoid holding
+    // a MutexGuard across an await point.
+    let cached = state.update_info.lock().unwrap().clone();
+    let update_info = if let Some(info) = cached {
+        info
+    } else {
+        let current_version = env!("APP_VERSION");
+        let info = do_update_check(current_version).await?;
+        *state.update_info.lock().unwrap() = Some(info.clone());
+        info
+    };
+
+    if !update_info.update_available {
+        return Ok("No update available".to_string());
+    }
+
+    let download_url = update_info.download_url.clone();
+    let checksums_url = update_info.checksums_url.clone();
+    let asset_filename = update_info.asset_filename.clone();
+
+    // Emit downloading stage
+    let _ = app_handle.emit("update-progress", serde_json::json!({ "stage": "downloading" }));
+    tracing::info!("[update] perform_auto_update: downloading from {}", download_url);
+
+    #[cfg(target_os = "macos")]
+    {
+        perform_auto_update_macos(download_url, checksums_url, asset_filename, app_handle).await
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        perform_auto_update_windows(download_url, checksums_url, asset_filename, app_handle).await
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (download_url, checksums_url, asset_filename, app_handle);
+        Err("Auto-update is not supported on this platform".to_string())
+    }
+}
+
+/// Download DMG, install, emit progress events and relaunch (macOS auto-update)
+#[cfg(target_os = "macos")]
+async fn perform_auto_update_macos(
+    download_url: String,
+    checksums_url: Option<String>,
+    asset_filename: Option<String>,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    let dmg_name = format!("voice-keyboard-update-{}.dmg", std::process::id());
+    let dmg_path = std::env::temp_dir().join(dmg_name);
+
+    download_and_verify(
+        &download_url,
+        &dmg_path,
+        checksums_url.as_deref(),
+        asset_filename.as_deref(),
+    ).await?;
+
+    // Emit installing stage
+    let _ = app_handle.emit("update-progress", serde_json::json!({ "stage": "installing" }));
+    tracing::info!("[update] perform_auto_update: installing");
+
+    let new_app_dest = install_app_from_dmg(&dmg_path)?;
+
+    // Emit restarting stage
+    let _ = app_handle.emit("update-progress", serde_json::json!({ "stage": "restarting" }));
+    tracing::info!("[update] perform_auto_update: restarting with {}", new_app_dest);
+
+    relaunch_and_exit(&app_handle, &new_app_dest).await;
+
+    Ok(format!("Update installed: {}", new_app_dest))
+}
+
+/// Download installer, launch silent NSIS install and exit (Windows auto-update)
+#[cfg(target_os = "windows")]
+async fn perform_auto_update_windows(
+    download_url: String,
+    checksums_url: Option<String>,
+    asset_filename: Option<String>,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    let installer_name = format!("voice-keyboard-update-{}.exe", std::process::id());
+    let installer_path = std::env::temp_dir().join(installer_name);
+
+    download_and_verify(
+        &download_url,
+        &installer_path,
+        checksums_url.as_deref(),
+        asset_filename.as_deref(),
+    ).await?;
+
+    // Emit installing stage
+    let _ = app_handle.emit("update-progress", serde_json::json!({ "stage": "installing" }));
+    tracing::info!("[update] perform_auto_update: launching installer {}", installer_path.display());
+
+    // Launch NSIS installer with /S (silent install)
+    Command::new(&installer_path)
+        .arg("/S")
+        .spawn()
+        .map_err(|e| {
+            let _ = fs::remove_file(&installer_path);
+            format!("Failed to launch installer: {}", e)
+        })?;
+
+    // Emit restarting stage
+    let _ = app_handle.emit("update-progress", serde_json::json!({ "stage": "restarting" }));
+    tracing::info!("[update] perform_auto_update: installer launched, exiting");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Exit current app so installer can replace files
+    // NSIS installer will relaunch the app after installation
+    app_handle.exit(0);
+
+    #[allow(unreachable_code)]
+    Ok("Installer launched".to_string())
+}
+
+// ============================================================================
 // Voice-typer process management
 // ============================================================================
 
+/// Locate the voice-typer binary by checking VOICE_TYPER_PATH env, then common build output dirs
 fn find_voice_typer_path() -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     const BINARY_NAME: &str = "voice-typer.exe";
@@ -728,6 +1426,7 @@ fn find_voice_typer_path() -> Result<PathBuf, String> {
     Err("voice-typer not found. Set VOICE_TYPER_PATH to the binary.".to_string())
 }
 
+/// Spawn the voice-typer child process with CLI args derived from AppConfig
 fn spawn_voice_typer(config: &AppConfig) -> Result<Child, String> {
     let path = find_voice_typer_path()?;
 
@@ -908,6 +1607,7 @@ fn extract_status(line: &str) -> Option<(&'static str, String)> {
     None
 }
 
+/// Emit a status-update event to the frontend and cache the latest status
 fn emit_status(app: &AppHandle, last_status: &Arc<Mutex<serde_json::Value>>, status: &str, text: &str) {
     let payload = serde_json::json!({
         "status": status,
@@ -917,6 +1617,7 @@ fn emit_status(app: &AppHandle, last_status: &Arc<Mutex<serde_json::Value>>, sta
     let _ = app.emit("status-update", &payload);
 }
 
+/// Store a debug line in memory and emit it to the frontend for real-time display
 fn emit_debug_line(app: &AppHandle, debug_lines: &Arc<Mutex<Vec<DebugLine>>>, line: &str, category: &str) {
     let ts = Local::now().format("%H:%M:%S%.3f").to_string();
     let debug_line = DebugLine {
@@ -940,6 +1641,7 @@ fn emit_debug_line(app: &AppHandle, debug_lines: &Arc<Mutex<Vec<DebugLine>>>, li
     let _ = app.emit("debug-log", &debug_line);
 }
 
+/// Start the background voice-typer process and begin reading its stdout/stderr
 fn start_voice_typer(state: &AppState, app: &AppHandle) {
     let mut guard = state.voice_typer.lock().unwrap();
     if guard.is_some() {
@@ -1074,6 +1776,7 @@ fn start_voice_typer(state: &AppState, app: &AppHandle) {
     }
 }
 
+/// Kill the background voice-typer process and wait for it to exit
 fn stop_voice_typer(state: &AppState) {
     let mut guard = state.voice_typer.lock().unwrap();
     if let Some(mut child) = guard.take() {
@@ -1099,6 +1802,7 @@ fn main() {
         config: Arc::new(Mutex::new(config)),
         voice_typer: Arc::new(Mutex::new(None)),
         last_status: Arc::new(Mutex::new(serde_json::json!({"status": "connecting", "text": "Starting..."}))),
+        update_info: Arc::new(Mutex::new(None)),
     };
 
     tauri::Builder::default()
@@ -1114,6 +1818,31 @@ fn main() {
             let handle = app.handle().clone();
             let state = app.state::<AppState>();
             start_voice_typer(&state, &handle);
+
+            // Background periodic update check
+            {
+                let bg_handle = app.handle().clone();
+                let bg_update_info = app.state::<AppState>().update_info.clone();
+                tauri::async_runtime::spawn(async move {
+                    // Wait 10 seconds after app start before first check
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    loop {
+                        let current_version = env!("APP_VERSION");
+                        match do_update_check(current_version).await {
+                            Ok(info) => {
+                                if info.update_available {
+                                    let _ = bg_handle.emit("update-available", &info);
+                                }
+                                *bg_update_info.lock().unwrap() = Some(info);
+                            }
+                            Err(e) => {
+                                tracing::warn!("[update] Update check failed: {}", e);
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
+                    }
+                });
+            }
 
             // Create tray menu
             let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
@@ -1149,6 +1878,25 @@ fn main() {
                         _ => {}
                     }
                 })
+                .on_tray_icon_event(|tray, event| {
+                    // On non-macOS platforms, open settings window on left click
+                    // (macOS uses show_menu_on_left_click instead)
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        if let TrayIconEvent::Click { button: MouseButton::Left, .. } = event {
+                            let app = tray.app_handle();
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                                let _ = window.emit("navigate", "settings");
+                            }
+                        }
+                    }
+                    #[cfg(target_os = "macos")]
+                    {
+                        let _ = (&tray, &event);
+                    }
+                })
                 .build(app)?;
 
             Ok(())
@@ -1172,6 +1920,10 @@ fn main() {
             open_privacy_settings,
             restart_voice_typer,
             get_audio_devices,
+            get_version_info,
+            check_for_update,
+            install_update,
+            perform_auto_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -1198,6 +1950,7 @@ fn main() {
         });
 }
 
+/// Load AppConfig from the platform config directory (falls back to defaults)
 fn load_config() -> AppConfig {
     let config_path = dirs::config_dir()
         .map(|p| p.join("voice-keyboard").join("config.json"));

@@ -7,18 +7,48 @@
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+    <div id="update-overlay" class="update-overlay" style="display: none;">
+      <div class="update-overlay-content">
+        <img src="app-icon.png" alt="Voice Keyboard" class="update-logo" />
+        <h1>Update Available</h1>
+        <p class="update-message">A new version of Voice Keyboard is available.</p>
+        <div class="update-versions">
+          <div class="version-row">
+            <span class="version-label">Current version:</span>
+            <span class="version-value" id="update-current-version">—</span>
+          </div>
+          <div class="version-row">
+            <span class="version-label">New version:</span>
+            <span class="version-value update-new" id="update-new-version">—</span>
+          </div>
+        </div>
+        <div class="update-buttons">
+          <button id="update-install-btn" class="btn-update" type="button" onclick="installUpdate()">Update</button>
+          <button id="update-later-btn" class="btn-update-later" type="button" onclick="dismissUpdateOverlay()">Later</button>
+        </div>
+        <div id="update-progress" class="update-progress" style="display: none;">
+          <div class="progress-bar-container">
+            <div class="progress-bar" id="update-progress-bar"></div>
+          </div>
+          <span id="update-progress-text" class="update-progress-text">Downloading...</span>
+        </div>
+        <p class="update-hint">The update will be downloaded and installed automatically.</p>
+      </div>
+    </div>
+
     <div class="app">
         <!-- Header with tabs -->
         <header class="header">
             <h1>Voice Keyboard</h1>
             <nav class="tabs">
-                <button class="tab active" data-tab="test">Test</button>
-                <button class="tab" data-tab="log">Log</button>
-                <button class="tab" data-tab="settings">Settings</button>
+                <button class="tab active" type="button" data-tab="test">Status</button>
+                <button class="tab" type="button" data-tab="prompts">Controls</button>
+                <button class="tab" type="button" data-tab="settings">Settings</button>
+                <button class="tab" type="button" data-tab="log">Log</button>
             </nav>
         </header>
 
-        <!-- Test Tab -->
+        <!-- Status Tab (was Test) -->
         <section id="test-tab" class="tab-content active">
             <!-- Info Cards -->
             <div class="test-info">
@@ -50,50 +80,62 @@
             </div>
         </section>
 
-        <!-- Log Tab (Debug) -->
-        <section id="log-tab" class="tab-content">
-            <div class="debug-toolbar">
-                <div class="debug-filters">
-                    <label class="filter-chip active" data-filter="all">
-                        <input type="checkbox" checked> All
-                    </label>
-                    <label class="filter-chip active" data-filter="system">
-                        <input type="checkbox" checked> System
-                    </label>
-                    <label class="filter-chip active" data-filter="recording">
-                        <input type="checkbox" checked> Recording
-                    </label>
-                    <label class="filter-chip active" data-filter="vad">
-                        <input type="checkbox" checked> VAD
-                    </label>
-                    <label class="filter-chip active" data-filter="worker">
-                        <input type="checkbox" checked> Worker
-                    </label>
-                    <label class="filter-chip active" data-filter="filter">
-                        <input type="checkbox" checked> Filter
-                    </label>
-                    <label class="filter-chip active" data-filter="transcription">
-                        <input type="checkbox" checked> Transcription
-                    </label>
-                    <label class="filter-chip active" data-filter="error">
-                        <input type="checkbox" checked> Errors
-                    </label>
-                </div>
-                <div class="debug-actions">
-                    <label class="auto-scroll-toggle">
-                        <input type="checkbox" id="debug-autoscroll" checked> Auto-scroll
-                    </label>
-                    <button id="clear-debug" class="btn btn-secondary btn-small">Clear</button>
-                </div>
+        <!-- Controls Tab (was Prompts) -->
+        <section id="prompts-tab" class="tab-content">
+            <div class="settings-group">
+                <h2>Hotkey</h2>
+                <select id="hotkey-select" class="select">
+                    <option value="fn">Fn (Function/Globe)</option>
+                    <option value="ctrl">Left Control</option>
+                    <option value="ctrlright">Right Control</option>
+                    <option value="alt">Left Alt/Option</option>
+                    <option value="altright">Right Alt/Option</option>
+                    <option value="shift">Left Shift</option>
+                    <option value="cmd">Left Cmd/Meta</option>
+                </select>
             </div>
 
-            <div class="debug-log-container">
-                <div id="debug-log" class="debug-log"></div>
+            <div class="settings-group">
+                <h2>Enhance messages</h2>
+                <p class="field-note">GPT processes transcription with an enhance message before typing. Leave empty for plain transcription.</p>
+                <label class="field">
+                    <span class="field-label">Default Enhance message (Hotkey alone)</span>
+                    <textarea id="preprompt-default" class="input" rows="3" placeholder="e.g. Translate to English"></textarea>
+                </label>
+                <label class="field">
+                    <span class="field-label">Enhance message 1 (Hotkey + 1)</span>
+                    <textarea id="preprompt-1" class="input" rows="3" placeholder="e.g. Fix grammar and punctuation"></textarea>
+                </label>
+                <label class="field">
+                    <span class="field-label">Enhance message 2 (Hotkey + 2)</span>
+                    <textarea id="preprompt-2" class="input" rows="3" placeholder="e.g. Summarize in bullet points"></textarea>
+                </label>
+                <label class="field">
+                    <span class="field-label">Enhance message 3 (Hotkey + 3)</span>
+                    <textarea id="preprompt-3" class="input" rows="3" placeholder="e.g. Rewrite formally"></textarea>
+                </label>
+            </div>
+
+            <div class="settings-actions">
+                <button id="save-prompts" type="button" class="btn btn-primary">Save & Reload</button>
             </div>
         </section>
 
         <!-- Settings Tab -->
         <section id="settings-tab" class="tab-content">
+            <div class="app-info-header">
+                <img src="app-icon.png" alt="Voice Keyboard" class="app-logo" />
+                <div class="app-info-details">
+                    <h2 class="app-name">Voice Keyboard</h2>
+                    <span class="app-version" id="app-version">...</span>
+                    <button type="button" class="app-update-status" id="app-update-status"></button>
+                </div>
+                <div class="app-info-actions">
+                    <button id="check-update-btn" type="button" class="btn btn-secondary btn-small" onclick="checkForUpdate()">Check for updates</button>
+                    <a href="#" id="github-link" class="btn-link" onclick="openGitHub(); return false;">GitHub</a>
+                </div>
+            </div>
+
             <div class="settings-group">
                 <h2>Transcription Mode</h2>
                 <div class="mode-selector">
@@ -143,19 +185,6 @@
             </div>
 
             <div class="settings-group">
-                <h2>Hotkey</h2>
-                <select id="hotkey-select" class="select">
-                    <option value="fn">Fn (Function/Globe)</option>
-                    <option value="ctrl">Left Control</option>
-                    <option value="ctrlright">Right Control</option>
-                    <option value="alt">Left Alt/Option</option>
-                    <option value="altright">Right Alt/Option</option>
-                    <option value="shift">Left Shift</option>
-                    <option value="cmd">Left Cmd/Meta</option>
-                </select>
-            </div>
-
-            <div class="settings-group">
                 <h2>Input Method</h2>
                 <select id="input-method-select" class="select">
                     <option value="keyboard">Keyboard Simulation</option>
@@ -194,29 +223,53 @@
                 <p class="field-note">Recordings shorter than this are ignored (avoids accidental taps).</p>
             </div>
 
-            <div class="settings-group">
-                <h2>Preprompts</h2>
-                <p class="field-note">GPT processes transcription with a preprompt before typing. Leave empty for plain transcription.</p>
-                <label class="field">
-                    <span class="field-label">Default (Hotkey alone)</span>
-                    <textarea id="preprompt-default" class="input" rows="3" placeholder="e.g. Translate to English"></textarea>
-                </label>
-                <label class="field">
-                    <span class="field-label">Preprompt 1 (Hotkey + 1)</span>
-                    <textarea id="preprompt-1" class="input" rows="3" placeholder="e.g. Fix grammar and punctuation"></textarea>
-                </label>
-                <label class="field">
-                    <span class="field-label">Preprompt 2 (Hotkey + 2)</span>
-                    <textarea id="preprompt-2" class="input" rows="3" placeholder="e.g. Summarize in bullet points"></textarea>
-                </label>
-                <label class="field">
-                    <span class="field-label">Preprompt 3 (Hotkey + 3)</span>
-                    <textarea id="preprompt-3" class="input" rows="3" placeholder="e.g. Rewrite formally"></textarea>
-                </label>
+            <div class="settings-actions">
+                <button id="save-settings" type="button" class="btn btn-primary">Save & Reload</button>
+            </div>
+        </section>
+
+        <!-- Log Tab (Debug) -->
+        <section id="log-tab" class="tab-content">
+            <div class="debug-toolbar">
+                <div class="debug-filters">
+                    <label class="filter-chip active" data-filter="all">
+                        <input type="checkbox" checked> All
+                    </label>
+                    <label class="filter-chip active" data-filter="system">
+                        <input type="checkbox" checked> System
+                    </label>
+                    <label class="filter-chip active" data-filter="recording">
+                        <input type="checkbox" checked> Recording
+                    </label>
+                    <label class="filter-chip active" data-filter="vad">
+                        <input type="checkbox" checked> VAD
+                    </label>
+                    <label class="filter-chip active" data-filter="worker">
+                        <input type="checkbox" checked> Worker
+                    </label>
+                    <label class="filter-chip active" data-filter="filter">
+                        <input type="checkbox" checked> Filter
+                    </label>
+                    <label class="filter-chip active" data-filter="transcription">
+                        <input type="checkbox" checked> Transcription
+                    </label>
+                    <label class="filter-chip active" data-filter="phrase">
+                        <input type="checkbox" checked> Phrase
+                    </label>
+                    <label class="filter-chip active" data-filter="error">
+                        <input type="checkbox" checked> Errors
+                    </label>
+                </div>
+                <div class="debug-actions">
+                    <label class="auto-scroll-toggle">
+                        <input type="checkbox" id="debug-autoscroll" checked> Auto-scroll
+                    </label>
+                    <button id="clear-debug" type="button" class="btn btn-secondary btn-small">Clear</button>
+                </div>
             </div>
 
-            <div class="settings-actions">
-                <button id="save-settings" class="btn btn-primary">Save & Reload</button>
+            <div class="debug-log-container">
+                <div id="debug-log" class="debug-log"></div>
             </div>
         </section>
     </div>
@@ -250,8 +303,8 @@
                 </div>
             </div>
             <div class="modal-actions">
-                <button id="open-settings-btn" class="btn btn-secondary">Open System Settings</button>
-                <button id="check-again-btn" class="btn btn-primary">Reload and Check</button>
+                <button id="open-settings-btn" type="button" class="btn btn-secondary">Open System Settings</button>
+                <button id="check-again-btn" type="button" class="btn btn-primary">Reload and Check</button>
             </div>
         </div>
     </div>
@@ -269,8 +322,8 @@
             </ul>
             <p class="note">No personal data is included except the audio you recorded.</p>
             <div class="modal-actions">
-                <button id="cancel-report" class="btn btn-secondary">Cancel</button>
-                <button id="create-report" class="btn btn-danger">Create & Open GitHub Issue</button>
+                <button id="cancel-report" type="button" class="btn btn-secondary">Cancel</button>
+                <button id="create-report" type="button" class="btn btn-danger">Create & Open GitHub Issue</button>
             </div>
         </div>
     </div>

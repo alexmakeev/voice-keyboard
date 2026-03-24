@@ -167,9 +167,13 @@ impl Config {
                 Err(_) => {
                     // Fallback: extract available fields from potentially incompatible format
                     // (e.g., Tauri UI config has different field types for hotkey, model, etc.)
-                    info!("Config format mismatch, extracting available fields from {}", path.display());
-                    let value: serde_json::Value = serde_json::from_str(&content)
-                        .map_err(|e| VoiceKeyboardError::Config(format!("Failed to parse config: {e}")))?;
+                    info!(
+                        "Config format mismatch, extracting available fields from {}",
+                        path.display()
+                    );
+                    let value: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+                        VoiceKeyboardError::Config(format!("Failed to parse config: {e}"))
+                    })?;
                     let mut config = Self::default();
                     if let Some(key) = value.get("openai_api_key").and_then(|v| v.as_str()) {
                         if !key.is_empty() {

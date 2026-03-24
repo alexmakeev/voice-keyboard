@@ -36,7 +36,11 @@ use base64::Engine as _;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use enigo::{Direction, Enigo, Key as EnigoKey, Keyboard, Settings};
 use indicatif::{ProgressBar, ProgressStyle};
-use rdev::{listen, Event, EventType, Key};
+#[cfg(target_os = "macos")]
+use rdev::grab;
+#[cfg(not(target_os = "macos"))]
+use rdev::listen;
+use rdev::{Event, EventType, Key};
 use reqwest::blocking::Client;
 use std::process::Command;
 
@@ -211,6 +215,165 @@ const VAD_SPEECH_CONFIRM_WINDOWS: usize = 2;
 enum RecordingState {
     Idle,
     Recording,
+}
+
+/// Wrapper to move non-Send closures to a worker thread.
+///
+/// The grab_fn callback passed to `rdev::grab` on macOS captures `cpal::Stream`
+/// (via `Arc<Mutex<Option<Stream>>>`), which is `!Send` due to internal raw pointers.
+/// However, the stream is always accessed through the Mutex, providing safe synchronization.
+/// The worker thread processes events sequentially, so there is no concurrent access.
+///
+/// SAFETY: The wrapped value is only ever accessed from a single worker thread.
+/// All shared state inside the closure is behind Arc<Mutex<..>> or Arc<AtomicBool>.
+#[cfg(target_os = "macos")]
+struct SendCallback<F>(F);
+
+#[cfg(target_os = "macos")]
+unsafe impl<F> Send for SendCallback<F> {}
+
+#[cfg(target_os = "macos")]
+impl<F: FnOnce()> SendCallback<F> {
+    fn run(self) {
+        (self.0)();
+    }
+}
+
+/// Start the platform-specific hotkey listener.
+///
+/// On macOS: uses `rdev::grab()` to intercept keyboard events, suppressing digit keys
+/// (1/2/3) while recording to prevent them from leaking into the active application.
+/// The callback is offloaded to a worker thread via a channel so the grab_fn returns
+/// immediately (rdev::grab blocks the keyboard until the callback returns).
+///
+/// On other platforms: uses `rdev::listen()` without key suppression.
+///
+/// Additionally, a 120-second recording timeout is enforced inside the grab_fn:
+/// if the recording state has been active for over 120 seconds (e.g., due to a lost
+/// key-release event), it is force-reset to Idle on any keyboard activity.
+///
+/// # Parameters
+/// - `state`: shared recording state for digit suppression and timeout checks
+/// - `recording_start`: timestamp of when recording started (for timeout detection)
+/// - `is_recording`: atomic flag for instant recording stop
+/// - `persistent_stream`: audio stream to pause on timeout recovery
+/// - `volume_controller`: to restore system volume on timeout recovery
+/// - `callback`: the event handler closure (different for each runner)
+#[allow(unused_variables)]
+fn start_hotkey_listener(
+    state: Arc<Mutex<RecordingState>>,
+    recording_start: Arc<Mutex<Option<Instant>>>,
+    is_recording: Arc<std::sync::atomic::AtomicBool>,
+    persistent_stream: Arc<Mutex<Option<cpal::Stream>>>,
+    volume_controller: Arc<voice_keyboard::volume::VolumeController>,
+    callback: impl FnMut(Event) + 'static,
+) {
+    #[cfg(target_os = "macos")]
+    {
+        let state_for_grab = Arc::clone(&state);
+        let recording_start_for_grab = Arc::clone(&recording_start);
+        let is_recording_for_grab = Arc::clone(&is_recording);
+        let persistent_stream_for_grab = Arc::clone(&persistent_stream);
+        let volume_controller_for_grab = Arc::clone(&volume_controller);
+
+        // Channel to offload heavy callback work from the grab_fn.
+        // rdev::grab blocks macOS keyboard input until the callback returns,
+        // so grab_fn must return immediately with just the suppress decision.
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+
+        // Worker thread: receives events and runs the (heavy) callback.
+        // SendCallback is needed because `callback` captures cpal::Stream (via Arc<Mutex>)
+        // which is !Send. Access is safe — see SendCallback docs above.
+        #[allow(unused_mut)]
+        let mut callback = callback;
+        let send_worker = SendCallback(move || {
+            while let Ok(event) = event_rx.recv() {
+                callback(event);
+            }
+        });
+        thread::spawn(move || send_worker.run());
+
+        let grab_fn = move |event: Event| -> Option<Event> {
+            // Recording timeout: force-stop if recording has been active for over 120 seconds.
+            // This check runs on every key event, so ANY keyboard activity triggers recovery.
+            {
+                let rec_state = state_for_grab.lock().unwrap();
+                if *rec_state == RecordingState::Recording {
+                    let timed_out = recording_start_for_grab
+                        .lock()
+                        .unwrap()
+                        .map(|start| start.elapsed() > Duration::from_secs(120))
+                        .unwrap_or(false);
+                    if timed_out {
+                        drop(rec_state);
+                        eprintln!(
+                            "[{}] WARNING: Recording timeout (120s) — force-stopping stuck recording",
+                            timestamp()
+                        );
+                        is_recording_for_grab.store(false, std::sync::atomic::Ordering::SeqCst);
+                        let mut rec_state = state_for_grab.lock().unwrap();
+                        *rec_state = RecordingState::Idle;
+                        *recording_start_for_grab.lock().unwrap() = None;
+                        drop(rec_state);
+
+                        // Pause audio stream
+                        {
+                            let stream_guard = persistent_stream_for_grab.lock().unwrap();
+                            if let Some(ref stream) = *stream_guard {
+                                let _ = stream.pause();
+                            }
+                        }
+
+                        // Restore system volume
+                        volume_controller_for_grab.restore();
+
+                        // Still forward the event to the worker thread
+                        let _ = event_tx.send(event.clone());
+                        return Some(event);
+                    }
+                }
+            }
+
+            let suppress = matches!(
+                event.event_type,
+                EventType::KeyPress(Key::Num1 | Key::Num2 | Key::Num3)
+                    | EventType::KeyRelease(Key::Num1 | Key::Num2 | Key::Num3)
+            ) && *state_for_grab.lock().unwrap() == RecordingState::Recording;
+
+            // Send event to worker thread for processing (non-blocking)
+            let _ = event_tx.send(event.clone());
+            if suppress {
+                None
+            } else {
+                Some(event)
+            }
+        };
+        if let Err(e) = grab(grab_fn) {
+            eprintln!("Error: {:?}", e);
+            eprintln!("\nGrant Input Monitoring permission:");
+            eprintln!("System Settings → Privacy & Security → Input Monitoring");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Err(e) = listen(callback) {
+            eprintln!("Error: {:?}", e);
+
+            #[cfg(target_os = "linux")]
+            {
+                eprintln!();
+                eprintln!("On Linux, make sure you have the necessary permissions.");
+                eprintln!("Try running with sudo or adding your user to the 'input' group:");
+                eprintln!("  sudo usermod -aG input $USER");
+                eprintln!("Then log out and back in.");
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                eprintln!("\nOn Windows, try running as Administrator.");
+            }
+        }
+    }
 }
 
 /// Text input method
@@ -745,6 +908,7 @@ impl Config {
     }
 }
 
+/// Load CLI config from the TOML file (cross-platform path)
 fn load_config() -> Config {
     let mut config = Config::new();
 
@@ -817,8 +981,7 @@ fn get_models_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home)
-            .join("Library/Application Support/voice-keyboard/models")
+        PathBuf::from(home).join("Library/Application Support/voice-keyboard/models")
     }
     #[cfg(target_os = "linux")]
     {
@@ -1005,6 +1168,7 @@ impl OpenAIConfig {
     }
 }
 
+/// Mask an API key for safe logging (show first/last 4 chars only)
 fn mask_api_key(key: &str) -> String {
     let trimmed = key.trim();
     if trimmed.len() <= 8 {
@@ -1018,10 +1182,8 @@ fn mask_api_key(key: &str) -> String {
 // ============================================================================
 
 /// Supported OpenRouter models for audio transcription
-const OPENROUTER_SUPPORTED_MODELS: &[&str] = &[
-    "google/gemini-2.5-flash",
-    "google/gemini-2.5-flash-lite",
-];
+const OPENROUTER_SUPPORTED_MODELS: &[&str] =
+    &["google/gemini-2.5-flash", "google/gemini-2.5-flash-lite"];
 
 /// OpenRouter API configuration
 #[derive(Clone)]
@@ -1184,8 +1346,12 @@ fn transcribe_openrouter_single_attempt(
         .text()
         .map_err(|e| format!("Failed to read OpenRouter response: {}", e))?;
 
-    let json: serde_json::Value = serde_json::from_str(&response_text)
-        .map_err(|e| format!("Failed to parse OpenRouter JSON: {} (response: {})", e, response_text))?;
+    let json: serde_json::Value = serde_json::from_str(&response_text).map_err(|e| {
+        format!(
+            "Failed to parse OpenRouter JSON: {} (response: {})",
+            e, response_text
+        )
+    })?;
 
     let content = json
         .get("choices")
@@ -1197,7 +1363,10 @@ fn transcribe_openrouter_single_attempt(
 
     let trimmed = content.trim();
     if trimmed.is_empty() || trimmed == "-" {
-        return Err(format!("Empty transcription from OpenRouter (raw content: {:?})", content));
+        return Err(format!(
+            "Empty transcription from OpenRouter (raw content: {:?})",
+            content
+        ));
     }
 
     Ok(trimmed.to_string())
@@ -1312,11 +1481,7 @@ fn transcribe_with_fallback(
             };
 
             // Sleep before trying fallback
-            println!(
-                "[{}] Trying fallback: {}...",
-                timestamp(),
-                fallback_name
-            );
+            println!("[{}] Trying fallback: {}...", timestamp(), fallback_name);
             std::thread::sleep(Duration::from_secs(1));
 
             // Try fallback backend
@@ -1324,10 +1489,14 @@ fn transcribe_with_fallback(
                 BackendConfig::OpenRouter(config) => {
                     transcribe_openrouter_internal(config, ogg_bytes, duration_secs)
                 }
-                BackendConfig::OpenAI(config) => {
-                    transcribe_openai_internal(config, samples, WHISPER_SAMPLE_RATE, prompt, use_ogg)
-                        .map(|(text, _raw)| text)
-                }
+                BackendConfig::OpenAI(config) => transcribe_openai_internal(
+                    config,
+                    samples,
+                    WHISPER_SAMPLE_RATE,
+                    prompt,
+                    use_ogg,
+                )
+                .map(|(text, _raw)| text),
             };
 
             match fallback_result {
@@ -1336,13 +1505,26 @@ fn transcribe_with_fallback(
                     Ok(text)
                 }
                 Err(fallback_err) => {
-                    eprintln!("[{}] Fallback {} also failed: {}", timestamp(), fallback_name, fallback_err);
+                    eprintln!(
+                        "[{}] Fallback {} also failed: {}",
+                        timestamp(),
+                        fallback_name,
+                        fallback_err
+                    );
                     // If either error is a network error, mark as CONNECTION_LOST for pending retry
-                    if e.starts_with(CONNECTION_LOST_PREFIX) || fallback_err.starts_with(CONNECTION_LOST_PREFIX) {
+                    if e.starts_with(CONNECTION_LOST_PREFIX)
+                        || fallback_err.starts_with(CONNECTION_LOST_PREFIX)
+                    {
                         print_connection_lost();
-                        Err(format!("{}Both backends failed: primary={}, fallback={}", CONNECTION_LOST_PREFIX, e, fallback_err))
+                        Err(format!(
+                            "{}Both backends failed: primary={}, fallback={}",
+                            CONNECTION_LOST_PREFIX, e, fallback_err
+                        ))
                     } else {
-                        Err(format!("Both backends failed: primary={}, fallback={}", e, fallback_err))
+                        Err(format!(
+                            "Both backends failed: primary={}, fallback={}",
+                            e, fallback_err
+                        ))
                     }
                 }
             }
@@ -1453,7 +1635,10 @@ fn print_connection_lost() {
 }
 
 /// Encode samples as WAV
-fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<(Vec<u8>, &'static str, &'static str), String> {
+fn encode_wav(
+    samples: &[f32],
+    sample_rate: u32,
+) -> Result<(Vec<u8>, &'static str, &'static str), String> {
     let mut wav_buffer = Cursor::new(Vec::new());
     {
         let spec = hound::WavSpec {
@@ -1519,7 +1704,11 @@ fn transcribe_openai_single_attempt(
             match ogg_opus::encode::<16000, 1>(&samples_i16) {
                 Ok(ogg_data) => (ogg_data, "audio.ogg", "audio/ogg"),
                 Err(e) => {
-                    eprintln!("[{}] OGG encoding failed: {:?}, falling back to WAV", timestamp(), e);
+                    eprintln!(
+                        "[{}] OGG encoding failed: {:?}, falling back to WAV",
+                        timestamp(),
+                        e
+                    );
                     encode_wav(samples, sample_rate)?
                 }
             }
@@ -1597,7 +1786,12 @@ fn transcribe_openai_single_attempt(
     let duration_secs = samples.len() as f64 / 16000.0;
     println!(
         "[{}] Sending: {:.1}s audio, {} {:.0} KB, body {:.0} KB, url: {}",
-        timestamp(), duration_secs, filename, audio_kb, body_kb, url
+        timestamp(),
+        duration_secs,
+        filename,
+        audio_kb,
+        body_kb,
+        url
     );
     std::io::stdout().flush().ok();
 
@@ -1746,6 +1940,18 @@ TEXT RULES:
 LANGUAGE: OUTPUT EVERYTHING IN ENGLISH regardless of input language.
 NO intro, NO meta - just content.";
 
+/// Suffix appended to every user-configurable preprompt.
+/// Ensures the API returns only the processed message text without any preamble.
+const PREPROMPT_NO_PREAMBLE_SUFFIX: &str = "\n\nIMPORTANT: Return ONLY the resulting text. Do not add any introductory phrases, explanations, labels, or commentary. Output nothing but the final message.";
+
+/// Wrap a user-configured preprompt with the no-preamble instruction.
+fn wrap_preprompt(preprompt: &str) -> String {
+    if preprompt.is_empty() {
+        return String::new();
+    }
+    format!("{}{}", preprompt, PREPROMPT_NO_PREAMBLE_SUFFIX)
+}
+
 /// Call GPT-4.1 Chat Completions API with custom system prompt
 /// Uses same API key and base URL as transcription (for proxy compatibility)
 fn call_chat_api(
@@ -1865,7 +2071,12 @@ fn improve_text_with_chat_api(
         "SELECTED TEXT:\n{}\n\nVOICE INSTRUCTION:\n{}",
         selected_text, voice_instruction
     );
-    call_chat_api(config, CHAT_IMPROVE_TEXT_PROMPT, &user_message, "Improve text")
+    call_chat_api(
+        config,
+        CHAT_IMPROVE_TEXT_PROMPT,
+        &user_message,
+        "Improve text",
+    )
 }
 
 fn resolve_model_path(model: &str) -> PathBuf {
@@ -1900,7 +2111,7 @@ fn get_model_path(model_arg: Option<String>) -> PathBuf {
 }
 
 fn print_version() {
-    const VERSION: &str = env!("CARGO_PKG_VERSION");
+    const VERSION: &str = env!("APP_VERSION");
     const NAME: &str = env!("CARGO_PKG_NAME");
     println!("{} {}", NAME, VERSION);
     println!();
@@ -2593,8 +2804,11 @@ fn main() {
                 if i + 1 < args.len() {
                     match args[i + 1].parse::<u64>() {
                         Ok(ms) => min_recording_ms = ms,
-                        Err(_) => eprintln!("Warning: invalid --min-recording value '{}', using default {}ms",
-                            args[i + 1], DEFAULT_MIN_RECORDING_MS),
+                        Err(_) => eprintln!(
+                            "Warning: invalid --min-recording value '{}', using default {}ms",
+                            args[i + 1],
+                            DEFAULT_MIN_RECORDING_MS
+                        ),
                     }
                     i += 1;
                 }
@@ -2603,8 +2817,10 @@ fn main() {
                 let val = arg.trim_start_matches("--min-recording=");
                 match val.parse::<u64>() {
                     Ok(ms) => min_recording_ms = ms,
-                    Err(_) => eprintln!("Warning: invalid --min-recording value '{}', using default {}ms",
-                        val, DEFAULT_MIN_RECORDING_MS),
+                    Err(_) => eprintln!(
+                        "Warning: invalid --min-recording value '{}', using default {}ms",
+                        val, DEFAULT_MIN_RECORDING_MS
+                    ),
                 }
             }
             "--extra-keys" | "--experimental" => {
@@ -2724,11 +2940,15 @@ fn main() {
             let (primary, fallback) = match (backend_order[0], backend_order[1]) {
                 (BackendKind::OpenAI, BackendKind::OpenRouter) => {
                     let p = BackendConfig::OpenAI(openai_config.expect("OpenAI config required"));
-                    let f = BackendConfig::OpenRouter(openrouter_config.expect("OpenRouter config required"));
+                    let f = BackendConfig::OpenRouter(
+                        openrouter_config.expect("OpenRouter config required"),
+                    );
                     (p, f)
                 }
                 (BackendKind::OpenRouter, BackendKind::OpenAI) => {
-                    let p = BackendConfig::OpenRouter(openrouter_config.expect("OpenRouter config required"));
+                    let p = BackendConfig::OpenRouter(
+                        openrouter_config.expect("OpenRouter config required"),
+                    );
                     let f = BackendConfig::OpenAI(openai_config.expect("OpenAI config required"));
                     (p, f)
                 }
@@ -2796,7 +3016,10 @@ fn main() {
             // OpenRouter only
             match OpenRouterConfig::load() {
                 Some(openrouter_config) => {
-                    println!("Transcription: OpenRouter API ({})", openrouter_config.model);
+                    println!(
+                        "Transcription: OpenRouter API ({})",
+                        openrouter_config.model
+                    );
                     println!("API Key: {}", mask_api_key(&openrouter_config.api_key));
                     run_openrouter(
                         openrouter_config,
@@ -2854,7 +3077,14 @@ fn main() {
                     enhance_config.normalize, enhance_config.noise_reduction,
                     enhance_config.remove_dc_offset, enhance_config.pre_emphasis);
                 println!();
-                run(ctx, input_method, hotkey, audio_device_name.clone(), lower_volume, min_recording_ms);
+                run(
+                    ctx,
+                    input_method,
+                    hotkey,
+                    audio_device_name.clone(),
+                    lower_volume,
+                    min_recording_ms,
+                );
             }
             Err(e) => {
                 eprintln!("Failed to load Whisper model: {}", e);
@@ -3290,8 +3520,15 @@ fn select_builtin_device_name() -> Option<String> {
     }
 
     let bt_patterns = [
-        "bluetooth", "airpods", "wireless", "beats", "bose", "jabra",
-        "galaxy buds", "sony wh", "sony wf",
+        "bluetooth",
+        "airpods",
+        "wireless",
+        "beats",
+        "bose",
+        "jabra",
+        "galaxy buds",
+        "sony wh",
+        "sony wf",
     ];
 
     #[cfg(target_os = "macos")]
@@ -3339,7 +3576,10 @@ fn select_builtin_device_name() -> Option<String> {
     }
 
     // Fallback: no preference — use default
-    println!("[{}] WARNING: No built-in mic found, will use default input device", timestamp());
+    println!(
+        "[{}] WARNING: No built-in mic found, will use default input device",
+        timestamp()
+    );
     std::io::stdout().flush().ok();
     None
 }
@@ -3428,6 +3668,7 @@ fn start_recording_persistent(
     Ok(stream)
 }
 
+/// Downsample 48 kHz audio to 16 kHz (Whisper's expected sample rate) by taking every 3rd sample
 fn resample_48k_to_16k(samples: &[f32]) -> Vec<f32> {
     samples.iter().step_by(3).copied().collect()
 }
@@ -3584,11 +3825,18 @@ fn replace_selected_text(
                         std::thread::sleep(Duration::from_millis(4));
                     }
                 }
-                println!("[{}] [WORKER] Text replaced via post_to_pid (pid={})", timestamp(), pid);
+                println!(
+                    "[{}] [WORKER] Text replaced via post_to_pid (pid={})",
+                    timestamp(),
+                    pid
+                );
                 return;
             }
         }
-        eprintln!("[{}] [WORKER] ✗ No target PID, falling back to enigo", timestamp());
+        eprintln!(
+            "[{}] [WORKER] ✗ No target PID, falling back to enigo",
+            timestamp()
+        );
     }
 
     // Fallback (non-macOS or no PID)
@@ -3645,12 +3893,18 @@ fn detect_selected_text() -> Option<String> {
         fn CFRelease(cf: *const c_void);
     }
 
-    println!("[{}] [IMPROVE] Detecting selected text (AX API)...", timestamp());
+    println!(
+        "[{}] [IMPROVE] Detecting selected text (AX API)...",
+        timestamp()
+    );
 
     unsafe {
         let system = AXUIElementCreateSystemWide();
         if system.is_null() {
-            println!("[{}] [IMPROVE] AXUIElementCreateSystemWide failed", timestamp());
+            println!(
+                "[{}] [IMPROVE] AXUIElementCreateSystemWide failed",
+                timestamp()
+            );
             return None;
         }
 
@@ -3665,7 +3919,11 @@ fn detect_selected_text() -> Option<String> {
         CFRelease(system);
 
         if err != AX_ERROR_SUCCESS || focused_element.is_null() {
-            println!("[{}] [IMPROVE] No focused element (AXError={})", timestamp(), err);
+            println!(
+                "[{}] [IMPROVE] No focused element (AXError={})",
+                timestamp(),
+                err
+            );
             return None;
         }
 
@@ -3680,7 +3938,11 @@ fn detect_selected_text() -> Option<String> {
         CFRelease(focused_element);
 
         if err != AX_ERROR_SUCCESS || selected_value.is_null() {
-            println!("[{}] [IMPROVE] No selected text (AXError={})", timestamp(), err);
+            println!(
+                "[{}] [IMPROVE] No selected text (AXError={})",
+                timestamp(),
+                err
+            );
             return None;
         }
 
@@ -3775,7 +4037,6 @@ fn play_beep(frequency: f32, duration_ms: u64) {
         play_beep_blocking(frequency, duration_ms);
     });
 }
-
 
 fn play_beep_blocking(frequency: f32, duration_ms: u64) {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -4418,7 +4679,11 @@ fn run_openai(
         if configured.is_empty() {
             println!("[{}] [PREPROMPT] No preprompts configured", timestamp());
         } else {
-            println!("[{}] [PREPROMPT] Configured: {}", timestamp(), configured.join(", "));
+            println!(
+                "[{}] [PREPROMPT] Configured: {}",
+                timestamp(),
+                configured.join(", ")
+            );
         }
         std::io::stdout().flush().ok();
     }
@@ -4482,14 +4747,22 @@ fn run_openai(
     } else if audio_device_name.is_empty() {
         None // system default
     } else {
-        println!("[{}] Using audio device: \"{}\"", timestamp(), audio_device_name);
+        println!(
+            "[{}] Using audio device: \"{}\"",
+            timestamp(),
+            audio_device_name
+        );
         Some(audio_device_name)
     };
 
     // Create persistent audio stream ONCE at startup (in paused state).
     // Use play()/pause() for instant mic on/off — no per-press device enumeration.
     let persistent_stream: Arc<Mutex<Option<cpal::Stream>>> = Arc::new(Mutex::new(None));
-    match start_recording_persistent(Arc::clone(&samples), Arc::clone(&is_recording), preferred_device_name.as_deref()) {
+    match start_recording_persistent(
+        Arc::clone(&samples),
+        Arc::clone(&is_recording),
+        preferred_device_name.as_deref(),
+    ) {
         Ok(stream) => {
             // Stream is created paused — mic indicator stays OFF until play() is called
             println!("[{}] Audio stream ready (paused)", timestamp());
@@ -4497,7 +4770,10 @@ fn run_openai(
         }
         Err(e) => {
             eprintln!("[{}] Failed to create audio stream: {}", timestamp(), e);
-            eprintln!("[{}] Recording will not work. Check microphone permissions.", timestamp());
+            eprintln!(
+                "[{}] Recording will not work. Check microphone permissions.",
+                timestamp()
+            );
             std::process::exit(1);
         }
     }
@@ -4523,15 +4799,19 @@ fn run_openai(
                         "\n[{}] ═══════════════════════════════════════════════════════════",
                         timestamp()
                     );
-                    println!("[PREPROMPT+SELECTED #{} (index={}, text-only)]", job.sequence_num, job.preprompt_index);
-                    println!("Selected: {}", selected.chars().take(80).collect::<String>());
                     println!(
-                        "═══════════════════════════════════════════════════════════\n"
+                        "[PREPROMPT+SELECTED #{} (index={}, text-only)]",
+                        job.sequence_num, job.preprompt_index
                     );
+                    println!(
+                        "Selected: {}",
+                        selected.chars().take(80).collect::<String>()
+                    );
+                    println!("═══════════════════════════════════════════════════════════\n");
 
                     match call_chat_api(
                         &config_for_worker,
-                        preprompt,
+                        &wrap_preprompt(preprompt),
                         selected,
                         "Preprompt+Selected",
                     ) {
@@ -4559,7 +4839,8 @@ fn run_openai(
                         Err(e) => {
                             eprintln!(
                                 "[{}] [WORKER] ✗ Preprompt+selected API failed: {}",
-                                timestamp(), e
+                                timestamp(),
+                                e
                             );
                             play_error_beep();
                             let _ = result_tx.send(TranscriptionOutput {
@@ -4937,25 +5218,44 @@ fn run_openai(
                             }
 
                             _ => {
-                                if job.selected_text.is_some() && job.preprompt_index > 0
-                                    && !preprompts_for_worker[job.preprompt_index as usize].is_empty()
+                                if job.selected_text.is_some()
+                                    && job.preprompt_index > 0
+                                    && !preprompts_for_worker[job.preprompt_index as usize]
+                                        .is_empty()
                                 {
                                     // PREPROMPT+SELECTED MODE: Apply preprompt to selected text
                                     let selected = job.selected_text.as_ref().unwrap();
-                                    let preprompt = &preprompts_for_worker[job.preprompt_index as usize];
-                                    let user_message = if transcribed_text.is_empty() || transcribed_text.trim() == "-" {
+                                    let preprompt =
+                                        &preprompts_for_worker[job.preprompt_index as usize];
+                                    let user_message = if transcribed_text.is_empty()
+                                        || transcribed_text.trim() == "-"
+                                    {
                                         selected.clone()
                                     } else {
-                                        format!("{}\n\nAdditional instruction: {}", selected, transcribed_text)
+                                        format!(
+                                            "{}\n\nAdditional instruction: {}",
+                                            selected, transcribed_text
+                                        )
                                     };
                                     println!(
                                         "\n[{}] ═══════════════════════════════════════════════════════════",
                                         timestamp()
                                     );
-                                    println!("[PREPROMPT+SELECTED #{} (index={})]", job.sequence_num, job.preprompt_index);
-                                    println!("Selected: {}", selected.chars().take(80).collect::<String>());
-                                    if !transcribed_text.is_empty() && transcribed_text.trim() != "-" {
-                                        println!("Voice: {}", transcribed_text.chars().take(80).collect::<String>());
+                                    println!(
+                                        "[PREPROMPT+SELECTED #{} (index={})]",
+                                        job.sequence_num, job.preprompt_index
+                                    );
+                                    println!(
+                                        "Selected: {}",
+                                        selected.chars().take(80).collect::<String>()
+                                    );
+                                    if !transcribed_text.is_empty()
+                                        && transcribed_text.trim() != "-"
+                                    {
+                                        println!(
+                                            "Voice: {}",
+                                            transcribed_text.chars().take(80).collect::<String>()
+                                        );
                                     }
                                     println!(
                                         "═══════════════════════════════════════════════════════════\n"
@@ -4963,7 +5263,7 @@ fn run_openai(
 
                                     match call_chat_api(
                                         &config_for_worker,
-                                        preprompt,
+                                        &wrap_preprompt(preprompt),
                                         &user_message,
                                         "Preprompt+Selected",
                                     ) {
@@ -4991,7 +5291,8 @@ fn run_openai(
                                         Err(e) => {
                                             eprintln!(
                                                 "[{}] [WORKER] ✗ Preprompt+selected API failed: {}",
-                                                timestamp(), e
+                                                timestamp(),
+                                                e
                                             );
                                             play_error_beep();
                                             let _ = result_tx.send(TranscriptionOutput {
@@ -5009,7 +5310,11 @@ fn run_openai(
                                         timestamp()
                                     );
                                     println!("[IMPROVE MODE #{}]", job.sequence_num);
-                                    println!("Selected ({} chars): {}...", selected.len(), selected.chars().take(80).collect::<String>());
+                                    println!(
+                                        "Selected ({} chars): {}...",
+                                        selected.len(),
+                                        selected.chars().take(80).collect::<String>()
+                                    );
                                     println!(
                                         "═══════════════════════════════════════════════════════════\n"
                                     );
@@ -5067,14 +5372,20 @@ fn run_openai(
                                             (transcribed_text.clone(), Some(e))
                                         }
                                     }
-                                } else if !preprompts_for_worker[job.preprompt_index as usize].is_empty() {
+                                } else if !preprompts_for_worker[job.preprompt_index as usize]
+                                    .is_empty()
+                                {
                                     // PREPROMPT MODE: Process transcription through GPT with preprompt
-                                    let preprompt = &preprompts_for_worker[job.preprompt_index as usize];
+                                    let preprompt =
+                                        &preprompts_for_worker[job.preprompt_index as usize];
                                     println!(
                                         "\n[{}] ═══════════════════════════════════════════════════════════",
                                         timestamp()
                                     );
-                                    println!("[PREPROMPT #{} (index={})]", job.sequence_num, job.preprompt_index);
+                                    println!(
+                                        "[PREPROMPT #{} (index={})]",
+                                        job.sequence_num, job.preprompt_index
+                                    );
                                     println!("Transcription: {}", transcribed_text);
                                     println!(
                                         "═══════════════════════════════════════════════════════════\n"
@@ -5088,7 +5399,7 @@ fn run_openai(
 
                                     match call_chat_api(
                                         &config_for_worker,
-                                        preprompt,
+                                        &wrap_preprompt(preprompt),
                                         &transcribed_text,
                                         "Preprompt",
                                     ) {
@@ -5105,7 +5416,11 @@ fn run_openai(
                                                 is_continuation,
                                                 sequence_num: job.sequence_num,
                                             }) {
-                                                eprintln!("[{}] [WORKER] ✗ Failed to send: {}", timestamp(), e);
+                                                eprintln!(
+                                                    "[{}] [WORKER] ✗ Failed to send: {}",
+                                                    timestamp(),
+                                                    e
+                                                );
                                             }
                                             (result, None)
                                         }
@@ -5117,12 +5432,18 @@ fn run_openai(
                                             );
 
                                             // Fallback: type raw transcription
-                                            if let Err(send_err) = result_tx.send(TranscriptionOutput {
-                                                text: transcribed_text.clone(),
-                                                is_continuation,
-                                                sequence_num: job.sequence_num,
-                                            }) {
-                                                eprintln!("[{}] [WORKER] ✗ Failed to send: {}", timestamp(), send_err);
+                                            if let Err(send_err) =
+                                                result_tx.send(TranscriptionOutput {
+                                                    text: transcribed_text.clone(),
+                                                    is_continuation,
+                                                    sequence_num: job.sequence_num,
+                                                })
+                                            {
+                                                eprintln!(
+                                                    "[{}] [WORKER] ✗ Failed to send: {}",
+                                                    timestamp(),
+                                                    send_err
+                                                );
                                             }
                                             (transcribed_text.clone(), Some(e))
                                         }
@@ -5144,7 +5465,11 @@ fn run_openai(
                                         is_continuation,
                                         sequence_num: job.sequence_num,
                                     }) {
-                                        eprintln!("[{}] [WORKER] ✗ Failed to send: {}", timestamp(), e);
+                                        eprintln!(
+                                            "[{}] [WORKER] ✗ Failed to send: {}",
+                                            timestamp(),
+                                            e
+                                        );
                                     }
                                     (transcribed_text.clone(), None)
                                 }
@@ -5669,10 +5994,48 @@ fn run_openai(
     let callback = move |event: Event| {
         use std::sync::atomic::Ordering;
 
+        // NOTE: Recording timeout (120s) is handled by start_hotkey_listener's grab_fn.
+        // It resets state to Idle, pauses the stream, and restores volume before the
+        // event reaches this callback.
+
         match event.event_type {
             EventType::KeyPress(key)
                 if key == target_key || target_key2 == Some(key) || target_key3 == Some(key) =>
             {
+                // Force-reset if stuck in Recording (lost KeyRelease recovery).
+                // Must check BEFORE debounce: when KeyRelease is lost, key_debounce
+                // stays true, so swap(true) would return true and hit early-return,
+                // making this recovery path unreachable.
+                {
+                    let mut rec_state = state_clone.lock().unwrap();
+                    if *rec_state == RecordingState::Recording {
+                        eprintln!(
+                            "[{}] WARNING: Forced reset — key pressed while already Recording (lost key_release event)",
+                            timestamp()
+                        );
+                        is_recording_clone.store(false, Ordering::SeqCst);
+                        *rec_state = RecordingState::Idle;
+                        drop(rec_state);
+
+                        // Pause audio stream
+                        {
+                            let stream_guard = persistent_stream_clone.lock().unwrap();
+                            if let Some(ref stream) = *stream_guard {
+                                let _ = stream.pause();
+                            }
+                        }
+
+                        // Restore system volume
+                        volume_controller_clone.restore();
+
+                        // Reset debounce so the next press starts fresh
+                        key_debounce_clone.store(false, Ordering::SeqCst);
+                        // Small delay before allowing a new recording
+                        thread::sleep(Duration::from_millis(200));
+                        return;
+                    }
+                }
+
                 if key_debounce_clone.swap(true, Ordering::SeqCst) {
                     return; // Already pressed, ignore repeat
                 }
@@ -5733,7 +6096,7 @@ fn run_openai(
                     mode_name
                 );
 
-                // Check if not already recording
+                // Start recording if idle
                 let mut rec_state = state_clone.lock().unwrap();
                 if *rec_state == RecordingState::Idle {
                     // Wait for any pending processing to complete before starting new session
@@ -5752,8 +6115,16 @@ fn run_openai(
                         drop(rec_state); // Release lock while waiting
 
                         // Wait for both: transcriptions to finish AND output to process all results
+                        let wait_start = Instant::now();
                         loop {
                             thread::sleep(Duration::from_millis(50));
+                            if wait_start.elapsed() > Duration::from_secs(10) {
+                                eprintln!(
+                                    "[{}] WARNING: Timed out waiting for previous transcription (10s), proceeding anyway",
+                                    timestamp()
+                                );
+                                break;
+                            }
                             let p = processing_count_clone.load(Ordering::SeqCst);
                             let j = next_sequence_clone.load(Ordering::SeqCst);
                             let o = next_output_seq_for_callback.load(Ordering::SeqCst);
@@ -5816,12 +6187,8 @@ fn run_openai(
                 }
             }
             // Number keys 1/2/3 during recording → select preprompt
-            EventType::KeyPress(key)
-                if matches!(key, Key::Num1 | Key::Num2 | Key::Num3) =>
-            {
-                let is_rec = {
-                    *state_clone.lock().unwrap() == RecordingState::Recording
-                };
+            EventType::KeyPress(key) if matches!(key, Key::Num1 | Key::Num2 | Key::Num3) => {
+                let is_rec = { *state_clone.lock().unwrap() == RecordingState::Recording };
                 if is_rec {
                     let idx = match key {
                         Key::Num1 => 1u8,
@@ -5832,31 +6199,6 @@ fn run_openai(
                     active_preprompt_callback.store(idx, Ordering::SeqCst);
                     println!("[{}] [PREPROMPT] Selected preprompt {}", timestamp(), idx);
                     std::io::stdout().flush().ok();
-
-                    // Undo the typed digit via Cmd+Z sent directly to the frontmost app
-                    // (post_to_pid bypasses our event listener, avoiding re-trigger)
-                    #[cfg(target_os = "macos")]
-                    {
-                        let pid = get_frontmost_app_pid();
-                        thread::spawn(move || {
-                            thread::sleep(Duration::from_millis(30));
-                            if let Some(pid) = pid {
-                                use core_graphics::event::{CGEvent, CGEventFlags};
-                                use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-                                if let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) {
-                                    // Cmd+Z: keycode 6 = 'z'
-                                    if let Ok(ev) = CGEvent::new_keyboard_event(source.clone(), 6, true) {
-                                        ev.set_flags(CGEventFlags::CGEventFlagCommand);
-                                        ev.post_to_pid(pid);
-                                    }
-                                    if let Ok(ev) = CGEvent::new_keyboard_event(source, 6, false) {
-                                        ev.set_flags(CGEventFlags::CGEventFlagCommand);
-                                        ev.post_to_pid(pid);
-                                    }
-                                }
-                            }
-                        });
-                    }
                 }
             }
             EventType::KeyRelease(key)
@@ -6012,7 +6354,8 @@ fn run_openai(
                         ));
 
                         let current_mode = output_mode_clone.load(Ordering::SeqCst);
-                        let current_preprompt_idx = active_preprompt_callback.load(Ordering::SeqCst);
+                        let current_preprompt_idx =
+                            active_preprompt_callback.load(Ordering::SeqCst);
                         let selected = selected_text_callback.lock().unwrap().take();
                         let _ = job_tx_callback.send(TranscriptionJob {
                             samples: phrase_samples,
@@ -6103,9 +6446,14 @@ fn run_openai(
         println!("");
     }
 
-    if let Err(e) = listen(callback) {
-        eprintln!("Error: {:?}", e);
-    }
+    start_hotkey_listener(
+        Arc::clone(&state),
+        Arc::clone(&recording_start),
+        Arc::clone(&is_recording),
+        Arc::clone(&persistent_stream),
+        Arc::clone(&volume_controller),
+        callback,
+    );
 }
 
 // ============================================================================
@@ -6113,7 +6461,14 @@ fn run_openai(
 // ============================================================================
 
 #[cfg(feature = "whisper")]
-fn run(whisper_ctx: whisper_rs::WhisperContext, input_method: InputMethod, hotkey: HotkeyType, audio_device_name: String, lower_volume: bool, min_recording_ms: u64) {
+fn run(
+    whisper_ctx: whisper_rs::WhisperContext,
+    input_method: InputMethod,
+    hotkey: HotkeyType,
+    audio_device_name: String,
+    lower_volume: bool,
+    min_recording_ms: u64,
+) {
     use std::sync::atomic::AtomicBool;
     use std::thread;
 
@@ -6138,20 +6493,31 @@ fn run(whisper_ctx: whisper_rs::WhisperContext, input_method: InputMethod, hotke
     } else if audio_device_name.is_empty() {
         None
     } else {
-        println!("[{}] Using audio device: \"{}\"", timestamp(), audio_device_name);
+        println!(
+            "[{}] Using audio device: \"{}\"",
+            timestamp(),
+            audio_device_name
+        );
         Some(audio_device_name)
     };
 
     // Create persistent audio stream ONCE at startup (in paused state).
     let persistent_stream: Arc<Mutex<Option<cpal::Stream>>> = Arc::new(Mutex::new(None));
-    match start_recording_persistent(Arc::clone(&samples), Arc::clone(&is_recording_flag), preferred_device_name.as_deref()) {
+    match start_recording_persistent(
+        Arc::clone(&samples),
+        Arc::clone(&is_recording_flag),
+        preferred_device_name.as_deref(),
+    ) {
         Ok(stream) => {
             println!("[{}] Audio stream ready (paused)", timestamp());
             *persistent_stream.lock().unwrap() = Some(stream);
         }
         Err(e) => {
             eprintln!("[{}] Failed to create audio stream: {}", timestamp(), e);
-            eprintln!("[{}] Recording will not work. Check microphone permissions.", timestamp());
+            eprintln!(
+                "[{}] Recording will not work. Check microphone permissions.",
+                timestamp()
+            );
             std::process::exit(1);
         }
     }
@@ -6384,6 +6750,31 @@ fn run(whisper_ctx: whisper_rs::WhisperContext, input_method: InputMethod, hotke
         match event.event_type {
             EventType::KeyPress(key) if key == target_key => {
                 let mut rec_state = state_clone.lock().unwrap();
+
+                // Force-reset if stuck in Recording (lost KeyRelease recovery)
+                if *rec_state == RecordingState::Recording {
+                    eprintln!(
+                        "[{}] WARNING: Forced reset — key pressed while already Recording (lost key_release event)",
+                        timestamp()
+                    );
+                    is_recording_clone.store(false, Ordering::SeqCst);
+                    *rec_state = RecordingState::Idle;
+
+                    // Pause audio stream
+                    {
+                        let stream_guard = persistent_stream_press.lock().unwrap();
+                        if let Some(ref stream) = *stream_guard {
+                            let _ = stream.pause();
+                        }
+                    }
+
+                    // Restore system volume
+                    volume_controller_clone.restore();
+
+                    drop(rec_state);
+                    thread::sleep(Duration::from_millis(200));
+                    return;
+                }
 
                 if *rec_state == RecordingState::Idle {
                     vad_clone.lock().unwrap().reset();
@@ -6619,28 +7010,14 @@ fn run(whisper_ctx: whisper_rs::WhisperContext, input_method: InputMethod, hotke
         VAD_SILENCE_MS
     );
 
-    if let Err(e) = listen(callback) {
-        eprintln!("Error: {:?}", e);
-
-        #[cfg(target_os = "macos")]
-        {
-            eprintln!("\nGrant Input Monitoring permission:");
-            eprintln!("System Settings → Privacy & Security → Input Monitoring");
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            eprintln!("\nOn Linux, you may need to:");
-            eprintln!("1. Run with sudo, OR");
-            eprintln!("2. Add yourself to the 'input' group:");
-            eprintln!("   sudo usermod -aG input $USER && newgrp input");
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            eprintln!("\nOn Windows, try running as Administrator.");
-        }
-    }
+    start_hotkey_listener(
+        Arc::clone(&state),
+        Arc::clone(&recording_start),
+        Arc::clone(&is_recording_flag),
+        Arc::clone(&persistent_stream),
+        Arc::clone(&volume_controller),
+        callback,
+    );
 }
 
 // ============================================================================
@@ -6675,7 +7052,11 @@ fn run_openrouter(
     } else if audio_device_name.is_empty() {
         None
     } else {
-        println!("[{}] Using audio device: \"{}\"", timestamp(), audio_device_name);
+        println!(
+            "[{}] Using audio device: \"{}\"",
+            timestamp(),
+            audio_device_name
+        );
         Some(audio_device_name)
     };
 
@@ -6692,7 +7073,10 @@ fn run_openrouter(
         }
         Err(e) => {
             eprintln!("[{}] Failed to create audio stream: {}", timestamp(), e);
-            eprintln!("[{}] Recording will not work. Check microphone permissions.", timestamp());
+            eprintln!(
+                "[{}] Recording will not work. Check microphone permissions.",
+                timestamp()
+            );
             std::process::exit(1);
         }
     }
@@ -6714,7 +7098,11 @@ fn run_openrouter(
                 job.duration_secs
             );
 
-            match transcribe_openrouter_internal(&config_for_worker, &job.ogg_bytes, job.duration_secs) {
+            match transcribe_openrouter_internal(
+                &config_for_worker,
+                &job.ogg_bytes,
+                job.duration_secs,
+            ) {
                 Ok(text) => {
                     let trimmed = text.trim();
                     if trimmed.is_empty() || trimmed == "-" {
@@ -6726,9 +7114,7 @@ fn run_openrouter(
                         );
                         println!("[TRANSCRIPTION]");
                         println!("{}", trimmed);
-                        println!(
-                            "═══════════════════════════════════════════════════════════\n"
-                        );
+                        println!("═══════════════════════════════════════════════════════════\n");
 
                         if let Err(e) = insert_text(trimmed, input_method) {
                             eprintln!("[{}] Failed to insert text: {}", timestamp(), e);
@@ -6776,15 +7162,38 @@ fn run_openrouter(
                     let mut pending = pending_retry_callback.lock().unwrap();
                     if let Some(job) = pending.take() {
                         play_retry_beep();
-                        println!(
-                            "[{}] [RETRY] Retrying previous failed job...",
-                            timestamp()
-                        );
+                        println!("[{}] [RETRY] Retrying previous failed job...", timestamp());
                         let _ = job_tx_callback.send(job);
                     }
                 }
 
                 let mut rec_state = state_clone.lock().unwrap();
+
+                // Force-reset if stuck in Recording (lost KeyRelease recovery)
+                if *rec_state == RecordingState::Recording {
+                    eprintln!(
+                        "[{}] WARNING: Forced reset — key pressed while already Recording (lost key_release event)",
+                        timestamp()
+                    );
+                    is_recording_clone.store(false, Ordering::SeqCst);
+                    *rec_state = RecordingState::Idle;
+
+                    // Pause audio stream
+                    {
+                        let stream_guard = persistent_stream_clone.lock().unwrap();
+                        if let Some(ref stream) = *stream_guard {
+                            let _ = stream.pause();
+                        }
+                    }
+
+                    // Restore system volume
+                    volume_controller_clone.restore();
+
+                    drop(rec_state);
+                    thread::sleep(Duration::from_millis(200));
+                    return;
+                }
+
                 if *rec_state == RecordingState::Idle {
                     samples_clone.lock().unwrap().clear();
                     vad_clone.lock().unwrap().reset();
@@ -6863,11 +7272,7 @@ fn run_openrouter(
 
                     let resampled = resample_48k_to_16k(&phrase_samples);
                     let duration_secs = resampled.len() as f32 / 16000.0;
-                    println!(
-                        "[{}] Encoding {:.1}s audio...",
-                        timestamp(),
-                        duration_secs
-                    );
+                    println!("[{}] Encoding {:.1}s audio...", timestamp(), duration_secs);
                     std::io::stdout().flush().ok();
 
                     // Encode as OGG/Opus (with 1s noise padding to prevent phrase truncation)
@@ -6877,7 +7282,9 @@ fn run_openrouter(
                         const NOISE_AMPLITUDE: f32 = 0.0005; // Very quiet, barely audible
                         let mut padded = resampled.clone();
                         for i in 0..PADDING_SAMPLES {
-                            let noise = ((i as f32 * 0.1).sin() * 0.5 + (i as f32 * 0.23).cos() * 0.5) * NOISE_AMPLITUDE;
+                            let noise = ((i as f32 * 0.1).sin() * 0.5
+                                + (i as f32 * 0.23).cos() * 0.5)
+                                * NOISE_AMPLITUDE;
                             padded.push(noise);
                         }
                         let samples_i16: Vec<i16> = padded
@@ -6890,7 +7297,8 @@ fn run_openrouter(
 
                     #[cfg(not(feature = "opus"))]
                     let ogg_result: Result<Vec<u8>, String> = Err(
-                        "OpenRouter mode requires OGG/Opus encoding. Build with --features opus".to_string()
+                        "OpenRouter mode requires OGG/Opus encoding. Build with --features opus"
+                            .to_string(),
                     );
 
                     let ogg_bytes = match ogg_result {
@@ -6929,17 +7337,14 @@ fn run_openrouter(
     #[cfg(not(feature = "opus"))]
     println!("WARNING: OpenRouter mode requires --features opus for OGG/Opus encoding");
 
-    if let Err(e) = listen(callback) {
-        eprintln!("Error: {:?}", e);
-        #[cfg(target_os = "linux")]
-        {
-            eprintln!();
-            eprintln!("On Linux, make sure you have the necessary permissions.");
-            eprintln!("Try running with sudo or adding your user to the 'input' group:");
-            eprintln!("  sudo usermod -aG input $USER");
-            eprintln!("Then log out and back in.");
-        }
-    }
+    start_hotkey_listener(
+        Arc::clone(&state),
+        Arc::clone(&recording_start),
+        Arc::clone(&is_recording),
+        Arc::clone(&persistent_stream),
+        Arc::clone(&volume_controller),
+        callback,
+    );
 }
 
 /// Cloud transcription with primary + fallback backends.
@@ -6990,7 +7395,11 @@ fn run_cloud(
     } else if audio_device_name.is_empty() {
         None
     } else {
-        println!("[{}] Using audio device: \"{}\"", timestamp(), audio_device_name);
+        println!(
+            "[{}] Using audio device: \"{}\"",
+            timestamp(),
+            audio_device_name
+        );
         Some(audio_device_name)
     };
 
@@ -7007,7 +7416,10 @@ fn run_cloud(
         }
         Err(e) => {
             eprintln!("[{}] Failed to create audio stream: {}", timestamp(), e);
-            eprintln!("[{}] Recording will not work. Check microphone permissions.", timestamp());
+            eprintln!(
+                "[{}] Recording will not work. Check microphone permissions.",
+                timestamp()
+            );
             std::process::exit(1);
         }
     }
@@ -7057,9 +7469,7 @@ fn run_cloud(
                         );
                         println!("[TRANSCRIPTION]");
                         println!("{}", trimmed);
-                        println!(
-                            "═══════════════════════════════════════════════════════════\n"
-                        );
+                        println!("═══════════════════════════════════════════════════════════\n");
 
                         if let Err(e) = insert_text(trimmed, input_method) {
                             eprintln!("[{}] Failed to insert text: {}", timestamp(), e);
@@ -7108,15 +7518,38 @@ fn run_cloud(
                     let mut pending = pending_retry_callback.lock().unwrap();
                     if let Some(job) = pending.take() {
                         play_retry_beep();
-                        println!(
-                            "[{}] [RETRY] Retrying previous failed job...",
-                            timestamp()
-                        );
+                        println!("[{}] [RETRY] Retrying previous failed job...", timestamp());
                         let _ = job_tx_callback.send(job);
                     }
                 }
 
                 let mut rec_state = state_clone.lock().unwrap();
+
+                // Force-reset if stuck in Recording (lost KeyRelease recovery)
+                if *rec_state == RecordingState::Recording {
+                    eprintln!(
+                        "[{}] WARNING: Forced reset — key pressed while already Recording (lost key_release event)",
+                        timestamp()
+                    );
+                    is_recording_clone.store(false, Ordering::SeqCst);
+                    *rec_state = RecordingState::Idle;
+
+                    // Pause audio stream
+                    {
+                        let stream_guard = persistent_stream_clone.lock().unwrap();
+                        if let Some(ref stream) = *stream_guard {
+                            let _ = stream.pause();
+                        }
+                    }
+
+                    // Restore system volume
+                    volume_controller_clone.restore();
+
+                    drop(rec_state);
+                    thread::sleep(Duration::from_millis(200));
+                    return;
+                }
+
                 if *rec_state == RecordingState::Idle {
                     samples_clone.lock().unwrap().clear();
                     vad_clone.lock().unwrap().reset();
@@ -7196,11 +7629,7 @@ fn run_cloud(
                     // Resample to 16kHz (needed for both backends)
                     let resampled = resample_48k_to_16k(&phrase_samples);
                     let duration_secs = resampled.len() as f32 / 16000.0;
-                    println!(
-                        "[{}] Encoding {:.1}s audio...",
-                        timestamp(),
-                        duration_secs
-                    );
+                    println!("[{}] Encoding {:.1}s audio...", timestamp(), duration_secs);
                     std::io::stdout().flush().ok();
 
                     // Encode as OGG/Opus (needed for OpenRouter, optional for OpenAI)
@@ -7211,7 +7640,9 @@ fn run_cloud(
                         const NOISE_AMPLITUDE: f32 = 0.0005; // Very quiet, barely audible
                         let mut padded = resampled.clone();
                         for i in 0..PADDING_SAMPLES {
-                            let noise = ((i as f32 * 0.1).sin() * 0.5 + (i as f32 * 0.23).cos() * 0.5) * NOISE_AMPLITUDE;
+                            let noise = ((i as f32 * 0.1).sin() * 0.5
+                                + (i as f32 * 0.23).cos() * 0.5)
+                                * NOISE_AMPLITUDE;
                             padded.push(noise);
                         }
                         let samples_i16: Vec<i16> = padded
@@ -7224,7 +7655,8 @@ fn run_cloud(
 
                     #[cfg(not(feature = "opus"))]
                     let ogg_result: Result<Vec<u8>, String> = Err(
-                        "Cloud mode requires OGG/Opus encoding. Build with --features opus".to_string()
+                        "Cloud mode requires OGG/Opus encoding. Build with --features opus"
+                            .to_string(),
                     );
 
                     let ogg_bytes = match ogg_result {
@@ -7261,21 +7693,17 @@ fn run_cloud(
     );
     println!(
         "Cloud mode: primary={}, fallback={}",
-        primary_name,
-        fallback_name
+        primary_name, fallback_name
     );
 
-    if let Err(e) = listen(callback) {
-        eprintln!("Error: {:?}", e);
-        #[cfg(target_os = "linux")]
-        {
-            eprintln!();
-            eprintln!("On Linux, make sure you have the necessary permissions.");
-            eprintln!("Try running with sudo or adding your user to the 'input' group:");
-            eprintln!("  sudo usermod -aG input $USER");
-            eprintln!("Then log out and back in.");
-        }
-    }
+    start_hotkey_listener(
+        Arc::clone(&state),
+        Arc::clone(&recording_start),
+        Arc::clone(&is_recording),
+        Arc::clone(&persistent_stream),
+        Arc::clone(&volume_controller),
+        callback,
+    );
 }
 
 #[cfg(test)]
@@ -7283,8 +7711,15 @@ mod tests {
     #[test]
     fn test_device_name_filtering() {
         let bt_patterns = [
-            "bluetooth", "airpods", "wireless", "beats", "bose", "jabra",
-            "galaxy buds", "sony wh", "sony wf",
+            "bluetooth",
+            "airpods",
+            "wireless",
+            "beats",
+            "bose",
+            "jabra",
+            "galaxy buds",
+            "sony wh",
+            "sony wf",
         ];
         let prefer_patterns = ["built-in", "macbook", "internal"];
 

@@ -571,6 +571,10 @@ cp target/release/voice-typer /Applications/Voice\ Keyboard.app/Contents/MacOS/v
 > If voice-typer was not built with `opus` feature, OGG compression will silently
 > fall back to WAV — the setting will appear to do nothing.
 
+#### Versioning
+
+The single source of truth for app version is `src-tauri/tauri.conf.json` field `"version"`. When releasing a new version, only this file needs to be updated — both Rust crates and the UI read it automatically via `build.rs`.
+
 ### Build Features Reference
 
 | Feature | Required | Description |

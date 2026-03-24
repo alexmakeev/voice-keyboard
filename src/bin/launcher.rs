@@ -35,7 +35,7 @@ fn main() -> ExitCode {
         }
     };
 
-    logger.log(&format!("Launcher started v{}", env!("CARGO_PKG_VERSION")));
+    logger.log(&format!("Launcher started v{}", env!("APP_VERSION")));
 
     // Load config
     let config = match Config::load() {

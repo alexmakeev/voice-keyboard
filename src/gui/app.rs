@@ -316,7 +316,7 @@ impl VoiceKeyboardApp {
             ui.label("Auto-Update");
 
             ui.horizontal(|ui| {
-                ui.label(format!("Current version: v{}", env!("CARGO_PKG_VERSION")));
+                ui.label(format!("Current version: v{}", env!("APP_VERSION")));
             });
 
             let mut state = self.state.lock().unwrap();

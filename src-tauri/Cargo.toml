@@ -1,6 +1,6 @@
 [package]
 name = "voice-keyboard-app"
-version = "0.1.0"
+version = "0.5.1"
 description = "Voice Keyboard - Speech to text with local Whisper"
 authors = ["Alex Mak"]
 license = "MIT"
@@ -9,6 +9,7 @@ edition = "2021"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+serde_json = "1"
 
 [dependencies]
 # Tauri
@@ -57,6 +58,12 @@ urlencoding = "2"
 
 # Open URLs in browser
 open = "5"
+
+# Version comparison for update checks
+semver = "1.0"
+
+# SHA256 checksum verification for updates
+sha2 = "0.10"
 
 # HTTP client for model downloads
 reqwest = { version = "0.12", features = ["stream", "rustls-tls"], default-features = false }

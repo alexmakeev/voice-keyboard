@@ -42,7 +42,7 @@ pub struct UpdateState {
 }
 
 fn default_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
+    env!("APP_VERSION").to_string()
 }
 
 impl Default for UpdateState {
