@@ -94,7 +94,8 @@ jobs:
       # Skip testing — cannot run ARM64 binaries on x64 runner
       - name: Test binaries
         shell: bash
-        run: echo "Skipping tests: cannot run ARM64 binaries on x64 runner"
+        run: |
+          echo "Skipping tests - cannot run ARM64 binaries on x64 runner"
 
       # Prepare artifacts
       - name: Prepare artifacts
