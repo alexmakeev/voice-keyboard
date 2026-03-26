@@ -4050,12 +4050,18 @@ fn play_beep_blocking(frequency: f32, duration_ms: u64) {
     let host = cpal::default_host();
     let device = match host.default_output_device() {
         Some(d) => d,
-        None => return,
+        None => {
+            eprintln!("[BEEP] No default output device found");
+            return;
+        }
     };
 
     let config = match device.default_output_config() {
         Ok(c) => c,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("[BEEP] Failed to get default output config: {}", e);
+            return;
+        }
     };
 
     let sample_rate = config.sample_rate().0 as f32;
@@ -4106,7 +4112,10 @@ fn play_beep_blocking(frequency: f32, duration_ms: u64) {
         None,
     ) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("[BEEP] Failed to build output stream: {}", e);
+            return;
+        }
     };
 
     let _ = stream.play();
@@ -4119,6 +4128,7 @@ fn play_beep_blocking(frequency: f32, duration_ms: u64) {
 }
 
 fn play_stop_beep() {
+    eprintln!("[BEEP] play_stop_beep called from thread {:?}", std::thread::current().name());
     play_beep(BEEP_STOP_FREQ, BEEP_STOP_DURATION_MS);
 }
 
