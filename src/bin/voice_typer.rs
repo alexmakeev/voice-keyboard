@@ -2561,6 +2561,13 @@ fn download_model_with_fallback(model_name: &str) -> Result<PathBuf, String> {
 // ============================================================================
 
 fn main() {
+    // Load .env early so VOICE_KEYBOARD_* vars are available before any env::var calls
+    let _ = dotenvy::dotenv();
+    let env_path = get_data_dir().join(".env");
+    if env_path.exists() {
+        let _ = dotenvy::from_path(&env_path);
+    }
+
     let config = load_config();
     let args: Vec<String> = env::args().collect();
     let mut model_arg: Option<String> = config.model.clone();
