@@ -2904,6 +2904,25 @@ fn main() {
         println!("  Right Option → translate to English");
     }
     println!("Input method: {}", input_mode_str);
+    {
+        let secs = std::env::var("VOICE_KEYBOARD_MAX_RECORDING_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+        let timeout_secs = secs.unwrap_or(DEFAULT_MAX_RECORDING_SECS);
+        let (value, unit) = if timeout_secs >= 60 {
+            (timeout_secs / 60, "min")
+        } else {
+            (timeout_secs, "sec")
+        };
+        if let Some(raw) = secs {
+            println!(
+                "Recording timeout: {} {} (VOICE_KEYBOARD_MAX_RECORDING_SECS={})",
+                value, unit, raw
+            );
+        } else {
+            println!("Recording timeout: {} {} (default)", value, unit);
+        }
+    }
     println!("Press Ctrl+C to exit\n");
     std::io::stdout().flush().ok();
 
