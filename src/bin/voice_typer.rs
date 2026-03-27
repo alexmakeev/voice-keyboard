@@ -169,6 +169,15 @@ fn get_openai_prompt() -> String {
     OPENAI_PROMPT_TEMPLATE.replace("{languages}", &get_languages())
 }
 
+/// Get the maximum recording duration from environment or use default
+fn max_recording_duration() -> Duration {
+    let secs = std::env::var("VOICE_KEYBOARD_MAX_RECORDING_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_RECORDING_SECS);
+    Duration::from_secs(secs)
+}
+
 // ============================================================================
 // Audio feedback and constants
 // ============================================================================
@@ -181,6 +190,10 @@ const BEEP_RETRY_DURATION_MS: u64 = 80; // Shorter beep for retry
 const BEEP_ERROR_FREQ: f32 = 220.0; // A3 - low pitch for error/silence detected
 const BEEP_ERROR_DURATION_MS: u64 = 70; // Short beep for error
 const BEEP_DEFAULT_VOLUME: f32 = 0.1; // 10% volume (0.0 - 1.0)
+
+/// Default maximum recording duration in seconds before force-stopping
+/// Override with VOICE_KEYBOARD_MAX_RECORDING_SECS environment variable
+const DEFAULT_MAX_RECORDING_SECS: u64 = 120;
 
 /// Short recording filter: recordings under this duration are checked for voice content
 /// Recordings >= this duration are always processed (let the API decide if it's silence)
@@ -293,8 +306,9 @@ fn start_hotkey_listener(
         });
         thread::spawn(move || send_worker.run());
 
+        let max_recording = max_recording_duration();
         let grab_fn = move |event: Event| -> Option<Event> {
-            // Recording timeout: force-stop if recording has been active for over 120 seconds.
+            // Recording timeout: force-stop if recording has been active too long.
             // This check runs on every key event, so ANY keyboard activity triggers recovery.
             {
                 let rec_state = state_for_grab.lock().unwrap();
@@ -302,13 +316,14 @@ fn start_hotkey_listener(
                     let timed_out = recording_start_for_grab
                         .lock()
                         .unwrap()
-                        .map(|start| start.elapsed() > Duration::from_secs(120))
+                        .map(|start| start.elapsed() > max_recording)
                         .unwrap_or(false);
                     if timed_out {
                         drop(rec_state);
                         eprintln!(
-                            "[{}] WARNING: Recording timeout (120s) — force-stopping stuck recording",
-                            timestamp()
+                            "[{}] WARNING: Recording timeout ({}s) — force-stopping stuck recording",
+                            timestamp(),
+                            max_recording.as_secs()
                         );
                         is_recording_for_grab.store(false, std::sync::atomic::Ordering::SeqCst);
                         let mut rec_state = state_for_grab.lock().unwrap();
