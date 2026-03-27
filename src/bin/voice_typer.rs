@@ -4168,9 +4168,60 @@ fn play_beep_blocking(frequency: f32, duration_ms: u64) {
     std::thread::sleep(Duration::from_millis(20));
 }
 
+// ============================================================================
+// Dedicated Audio Thread
+//
+// On macOS, CoreAudio requires a proper thread context (NSRunLoop) to play
+// sounds. When play_stop_beep() is called from the rdev::grab() worker thread,
+// that thread has no run loop, so CoreAudio silently fails. The fix: route all
+// stop-beep playback through a long-lived named thread where cpal/CoreAudio
+// can initialize properly.
+// ============================================================================
+
+enum AudioCommand {
+    PlayBeep { frequency: f32, duration_ms: u64 },
+}
+
+static AUDIO_TX: std::sync::OnceLock<std::sync::mpsc::Sender<AudioCommand>> =
+    std::sync::OnceLock::new();
+
+fn spawn_audio_thread() -> std::sync::mpsc::Sender<AudioCommand> {
+    let (tx, rx) = std::sync::mpsc::channel::<AudioCommand>();
+    std::thread::Builder::new()
+        .name("audio-beep".to_string())
+        .spawn(move || {
+            // On macOS, a CFRunLoop is automatically created per-thread on first
+            // access by CoreAudio. By keeping this dedicated thread alive and doing
+            // all audio work here, CoreAudio has a stable thread context.
+            eprintln!("[BEEP] Audio thread started (thread: {:?})", std::thread::current().name());
+            for cmd in rx {
+                match cmd {
+                    AudioCommand::PlayBeep { frequency, duration_ms } => {
+                        play_beep_blocking(frequency, duration_ms);
+                    }
+                }
+            }
+            eprintln!("[BEEP] Audio thread exiting");
+        })
+        .expect("Failed to spawn audio-beep thread");
+    tx
+}
+
+fn init_audio_thread() {
+    AUDIO_TX.get_or_init(spawn_audio_thread);
+}
+
 fn play_stop_beep() {
     eprintln!("[BEEP] play_stop_beep called from thread {:?}", std::thread::current().name());
-    play_beep(BEEP_STOP_FREQ, BEEP_STOP_DURATION_MS);
+    if let Some(tx) = AUDIO_TX.get() {
+        let _ = tx.send(AudioCommand::PlayBeep {
+            frequency: BEEP_STOP_FREQ,
+            duration_ms: BEEP_STOP_DURATION_MS,
+        });
+    } else {
+        eprintln!("[BEEP] Audio thread not initialized, falling back to direct playback");
+        play_beep(BEEP_STOP_FREQ, BEEP_STOP_DURATION_MS);
+    }
 }
 
 /// Play double beep to indicate retry of previous failed request
@@ -4669,6 +4720,8 @@ fn run_openai(
 ) {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8};
     use std::sync::mpsc;
+
+    init_audio_thread();
 
     let dev_mode = is_dev_mode();
     if dev_mode {
@@ -7086,6 +7139,8 @@ fn run_openrouter(
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
 
+    init_audio_thread();
+
     let config = Arc::new(openrouter_config);
     let target_key = hotkey.to_rdev_key();
 
@@ -7412,6 +7467,8 @@ fn run_cloud(
 ) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
+
+    init_audio_thread();
 
     let primary_name = match &primary {
         BackendConfig::OpenRouter(_) => "OpenRouter",
