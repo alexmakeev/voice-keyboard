@@ -4180,6 +4180,7 @@ fn play_beep_blocking(frequency: f32, duration_ms: u64) {
 
 enum AudioCommand {
     PlayBeep { frequency: f32, duration_ms: u64 },
+    PlayBeepSequence { beeps: Vec<(f32, u64, f32)>, pause_ms: u64 },
 }
 
 static AUDIO_TX: std::sync::OnceLock<std::sync::mpsc::Sender<AudioCommand>> =
@@ -4198,6 +4199,14 @@ fn spawn_audio_thread() -> std::sync::mpsc::Sender<AudioCommand> {
                 match cmd {
                     AudioCommand::PlayBeep { frequency, duration_ms } => {
                         play_beep_blocking(frequency, duration_ms);
+                    }
+                    AudioCommand::PlayBeepSequence { beeps, pause_ms } => {
+                        for (i, (freq, dur, _vol)) in beeps.iter().enumerate() {
+                            play_beep_blocking(*freq, *dur);
+                            if i < beeps.len() - 1 {
+                                std::thread::sleep(Duration::from_millis(pause_ms));
+                            }
+                        }
                     }
                 }
             }
@@ -4226,22 +4235,34 @@ fn play_stop_beep() {
 
 /// Play double beep to indicate retry of previous failed request
 fn play_retry_beep() {
-    use std::thread;
-    thread::spawn(|| {
-        play_beep_blocking(BEEP_RETRY_FREQ, BEEP_RETRY_DURATION_MS);
-        thread::sleep(Duration::from_millis(100)); // Longer pause to let DAC stabilize
-        play_beep_blocking(BEEP_RETRY_FREQ, BEEP_RETRY_DURATION_MS);
-    });
+    if let Some(tx) = AUDIO_TX.get() {
+        let _ = tx.send(AudioCommand::PlayBeepSequence {
+            beeps: vec![
+                (BEEP_RETRY_FREQ, BEEP_RETRY_DURATION_MS, BEEP_DEFAULT_VOLUME),
+                (BEEP_RETRY_FREQ, BEEP_RETRY_DURATION_MS, BEEP_DEFAULT_VOLUME),
+            ],
+            pause_ms: 100, // Longer pause to let DAC stabilize
+        });
+    } else {
+        eprintln!("[BEEP] Audio thread not initialized, falling back to direct playback");
+        play_beep(BEEP_RETRY_FREQ, BEEP_RETRY_DURATION_MS);
+    }
 }
 
 /// Play low double beep to indicate error (silence detected, recording skipped)
 fn play_error_beep() {
-    use std::thread;
-    thread::spawn(|| {
-        play_beep_blocking(BEEP_ERROR_FREQ, BEEP_ERROR_DURATION_MS);
-        thread::sleep(Duration::from_millis(100)); // Longer pause to let DAC stabilize
-        play_beep_blocking(BEEP_ERROR_FREQ, BEEP_ERROR_DURATION_MS);
-    });
+    if let Some(tx) = AUDIO_TX.get() {
+        let _ = tx.send(AudioCommand::PlayBeepSequence {
+            beeps: vec![
+                (BEEP_ERROR_FREQ, BEEP_ERROR_DURATION_MS, BEEP_DEFAULT_VOLUME),
+                (BEEP_ERROR_FREQ, BEEP_ERROR_DURATION_MS, BEEP_DEFAULT_VOLUME),
+            ],
+            pause_ms: 100, // Longer pause to let DAC stabilize
+        });
+    } else {
+        eprintln!("[BEEP] Audio thread not initialized, falling back to direct playback");
+        play_beep(BEEP_ERROR_FREQ, BEEP_ERROR_DURATION_MS);
+    }
 }
 
 // ============================================================================
