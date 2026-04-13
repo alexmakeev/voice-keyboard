@@ -264,14 +264,9 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ matrix.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ matrix.os }}-cargo-release-
+          key: ${{ matrix.target }}-release
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
@@ -378,7 +373,7 @@ jobs:
           > Note: The DMG is unsigned. On first launch, right-click → Open, or go to System Preferences → Privacy & Security → Open Anyway.
 
           ### Windows
-          - **Windows x64:** `voice-keyboard-windows-x64.zip`
+          - **Windows x64:** `voice-typer-windows-x64.zip`
 
           ### Standalone voice-typer binary
           - `voice-typer-macos-arm64.zip`

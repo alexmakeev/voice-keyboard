@@ -173,10 +173,10 @@ function setupEventListeners() {
     // Clear debug log
     elements.clearDebugBtn.addEventListener('click', async () => {
         debugLines = [];
-        lastPollDebugCount = 0;
         renderDebugLog();
         try {
             await invoke('clear_debug_log');
+            lastPollDebugCount = 0;
         } catch (e) {
             console.error('Failed to clear debug log:', e);
         }

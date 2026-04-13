@@ -23,7 +23,7 @@ jobs:
           - os: macos-15-intel
             features: "whisper"
           - os: windows-latest
-            features: "whisper"
+            features: "whisper,opus"
 
     runs-on: ${{ matrix.os }}
 
@@ -89,7 +89,7 @@ jobs:
             features: "whisper"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            features: "whisper"
+            features: "whisper,opus"
 
     runs-on: ${{ matrix.os }}
 
@@ -209,7 +209,7 @@ jobs:
         shell: bash
         run: |
           # Quick test that model can be loaded (will fail on hotkey, but that's OK)
-          timeout 5 ./target/${{ matrix.target }}/release/voice-typer --model tiny 2>&1 | head -20 || true
+          perl -e 'alarm(5); exec @ARGV' -- ./target/${{ matrix.target }}/release/voice-typer --model tiny 2>&1 | head -20 || true
           echo "Model loading test completed"
 
   # Build Tauri app for macOS
@@ -237,14 +237,9 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ matrix.os }}-cargo-tauri-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ matrix.os }}-cargo-tauri-
+          key: ${{ matrix.target }}-tauri
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
