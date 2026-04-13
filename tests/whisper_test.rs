@@ -8,9 +8,22 @@ mod tests {
     use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
     fn get_model_path() -> PathBuf {
-        std::env::var("MODEL_PATH")
+        let path = std::env::var("MODEL_PATH")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("./models/ggml-tiny.bin"))
+            .unwrap_or_else(|_| PathBuf::from("./models/ggml-tiny.bin"));
+
+        // In CI with CI_REQUIRE_MODEL=1, panic if model is missing instead of silently skipping
+        if !path.exists() {
+            if std::env::var("CI_REQUIRE_MODEL").as_deref() == Ok("1") {
+                panic!(
+                    "CI_REQUIRE_MODEL=1 but model not found at {}. \
+                     Ensure the model is downloaded before running tests.",
+                    path.display()
+                );
+            }
+        }
+
+        path
     }
 
     fn load_wav(path: &str) -> Vec<f32> {
@@ -258,6 +271,13 @@ mod tests {
         assert!(
             result.len() > 10,
             "Expected Russian transcription to contain text, got: '{}'",
+            result
+        );
+
+        // Russian transcription must contain Cyrillic characters
+        assert!(
+            result.chars().any(|c| c >= '\u{0400}' && c <= '\u{04FF}'),
+            "Russian transcription should contain Cyrillic characters, got: '{}'",
             result
         );
 

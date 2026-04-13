@@ -176,6 +176,7 @@ function setupEventListeners() {
         renderDebugLog();
         try {
             await invoke('clear_debug_log');
+            lastPollDebugCount = 0;
         } catch (e) {
             console.error('Failed to clear debug log:', e);
         }
