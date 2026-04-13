@@ -137,7 +137,7 @@ jobs:
             ./target/${{ matrix.target }}/release/voice-typer --help
           fi
 
-  # Integration test with Whisper model (Linux + macOS)
+  # Integration test with Whisper model (Linux + macOS — Linux builds without AVX2)
   integration-test:
     needs: [check]
     strategy:
@@ -171,7 +171,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}-integration
+          key: ${{ matrix.target }}-integration-noavx
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -200,9 +200,15 @@ jobs:
           fi
 
       - name: Build
+        env:
+          CMAKE_C_FLAGS: ${{ runner.os == 'Linux' && '-mno-avx2 -mno-avx -mno-fma -mno-f16c' || '' }}
+          CMAKE_CXX_FLAGS: ${{ runner.os == 'Linux' && '-mno-avx2 -mno-avx -mno-fma -mno-f16c' || '' }}
         run: cargo build --release --bin voice-typer --features "${{ matrix.features }}" --target ${{ matrix.target }}
 
       - name: Run integration tests
+        env:
+          CMAKE_C_FLAGS: ${{ runner.os == 'Linux' && '-mno-avx2 -mno-avx -mno-fma -mno-f16c' || '' }}
+          CMAKE_CXX_FLAGS: ${{ runner.os == 'Linux' && '-mno-avx2 -mno-avx -mno-fma -mno-f16c' || '' }}
         run: cargo test --test whisper_test --features "${{ matrix.features }}" --target ${{ matrix.target }} -- --nocapture
 
       - name: Verify model loads
