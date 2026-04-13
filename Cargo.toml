@@ -77,7 +77,7 @@ sha2 = { version = "0.10", optional = true }
 # Archive extraction
 flate2 = { version = "1.0", optional = true }
 tar = { version = "0.4", optional = true }
-zip = { version = "2.2", optional = true, default-features = false, features = ["deflate"] }
+zip = { version = "8.5", optional = true, default-features = false, features = ["deflate"] }
 
 # macOS-only dependencies (including tray)
 [target.'cfg(target_os = "macos")'.dependencies]
