@@ -51,9 +51,9 @@ dotenvy = "0.15"
 base64 = "0.22"
 
 # Cross-platform audio and input
-cpal = "0.15"           # Audio recording (CoreAudio/ALSA/WASAPI)
+cpal = "0.16"           # Audio recording (CoreAudio/ALSA/WASAPI)
 rdev = { version = "0.5", default-features = false }  # Global hotkeys; unstable_grab added per-platform below
-enigo = "0.2"           # Keyboard simulation
+enigo = "0.6"           # Keyboard simulation
 
 # GUI dependencies (optional, enabled with --features gui)
 egui = { version = "0.30", optional = true }
@@ -81,7 +81,7 @@ zip = { version = "2.2", optional = true, default-features = false, features = [
 
 # macOS-only dependencies (including tray)
 [target.'cfg(target_os = "macos")'.dependencies]
-tray-icon = { version = "0.19", optional = true }
+tray-icon = { version = "0.21", optional = true }
 muda = { version = "0.15", optional = true }
 cocoa = "0.26"          # macOS clipboard for files
 objc = "0.2"            # Objective-C runtime
@@ -91,12 +91,12 @@ rdev = { version = "0.5", features = ["unstable_grab"] }  # grab() for key suppr
 
 # Windows-only dependencies (tray)
 [target.'cfg(target_os = "windows")'.dependencies]
-tray-icon = { version = "0.19", optional = true }
+tray-icon = { version = "0.21", optional = true }
 muda = { version = "0.15", optional = true }
 
 # Linux tray requires GTK dev packages (libgtk-3-dev, libappindicator3-dev)
 [target.'cfg(target_os = "linux")'.dependencies]
-tray-icon = { version = "0.19", optional = true }
+tray-icon = { version = "0.21", optional = true }
 muda = { version = "0.15", optional = true }
 
 # Minimal binary - standalone, no whisper dependency
