@@ -85,7 +85,7 @@ tray-icon = { version = "0.19", optional = true }
 muda = { version = "0.15", optional = true }
 cocoa = "0.26"          # macOS clipboard for files
 objc = "0.2"            # Objective-C runtime
-core-graphics = { version = "0.24", features = ["elcapitan"] }  # CGEvent with post_to_pid
+core-graphics = { version = "0.25", features = ["elcapitan"] }  # CGEvent with post_to_pid
 core-foundation = "0.9"  # CFString for Accessibility API
 rdev = { version = "0.5", features = ["unstable_grab"] }  # grab() for key suppression
 
