@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build only, skip publishing a GitHub Release"
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -304,6 +310,7 @@ jobs:
 
   # Create GitHub Release
   release:
+    if: github.event_name == 'push' || inputs.dry_run == false
     needs: [build-windows, build-windows-arm, build-tauri-windows, build-tauri-windows-arm, build-tauri-macos, build-macos]
     runs-on: ubuntu-latest
     permissions:

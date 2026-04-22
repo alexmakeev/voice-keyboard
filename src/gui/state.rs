@@ -226,6 +226,7 @@ impl AppState {
             update_channel: self.update_channel,
             update_url: None,
             extra_keys_enabled: self.extra_keys_enabled,
+            ..Default::default()
         };
 
         config.save()?;
