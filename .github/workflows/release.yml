@@ -94,6 +94,7 @@ jobs:
         env:
           CC: clang-cl
           CXX: clang-cl
+          CXXFLAGS: /EHsc
           CMAKE_GENERATOR: Ninja
         run: cargo build --release --bin voice-typer --features "whisper,opus,gui,updater" --target aarch64-pc-windows-msvc
 
@@ -191,6 +192,7 @@ jobs:
         env:
           CC: clang-cl
           CXX: clang-cl
+          CXXFLAGS: /EHsc
           CMAKE_GENERATOR: Ninja
         run: cargo build --release --bin voice-typer --features "whisper,opus" --target aarch64-pc-windows-msvc
 
