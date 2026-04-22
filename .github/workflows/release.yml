@@ -71,66 +71,6 @@ jobs:
           name: voice-typer-x86_64-pc-windows-msvc
           path: voice-typer-x86_64-pc-windows-msvc.zip
 
-  # Windows ARM64 CLI build with launcher + core app
-  build-windows-arm:
-    runs-on: windows-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-pc-windows-msvc
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: windows-arm-release
-
-      # Build core app (voice-typer) with all features
-      - name: Build voice-typer
-        env:
-          CC: clang-cl
-          CXX: clang-cl
-          CXXFLAGS: /EHsc
-          CMAKE_GENERATOR: Ninja
-        run: cargo build --release --bin voice-typer --features "whisper,opus,gui,updater" --target aarch64-pc-windows-msvc
-
-      # Build launcher
-      - name: Build launcher
-        run: cargo build --release --bin voice-typer-launcher --features "updater" --target aarch64-pc-windows-msvc
-
-      # Skip testing — cannot run ARM64 binaries on x64 runner
-      - name: Test binaries
-        shell: bash
-        run: |
-          echo "Skipping tests - cannot run ARM64 binaries on x64 runner"
-
-      # Prepare artifacts
-      - name: Prepare artifacts
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist
-
-          # Copy both executables
-          Copy-Item "target/aarch64-pc-windows-msvc/release/voice-typer.exe" -Destination "dist/"
-          Copy-Item "target/aarch64-pc-windows-msvc/release/voice-typer-launcher.exe" -Destination "dist/"
-
-          # Copy docs
-          Copy-Item "README.md" -Destination "dist/" -ErrorAction SilentlyContinue
-          Copy-Item "LICENSE" -Destination "dist/"
-
-          # Create zip
-          Compress-Archive -Path "dist/*" -DestinationPath "voice-typer-aarch64-pc-windows-msvc.zip"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v5
-        with:
-          name: voice-typer-aarch64-pc-windows-msvc
-          path: voice-typer-aarch64-pc-windows-msvc.zip
-
   # Windows Tauri GUI app (NSIS installer)
   build-tauri-windows:
     runs-on: windows-latest
@@ -169,50 +109,6 @@ jobs:
         with:
           name: voice-keyboard-windows-x64-setup
           path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
-
-  # Windows ARM64 Tauri GUI app (NSIS installer)
-  build-tauri-windows-arm:
-    runs-on: windows-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-pc-windows-msvc
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: windows-arm-tauri
-
-      - name: Build voice-typer sidecar
-        env:
-          CC: clang-cl
-          CXX: clang-cl
-          CXXFLAGS: /EHsc
-          CMAKE_GENERATOR: Ninja
-        run: cargo build --release --bin voice-typer --features "whisper,opus" --target aarch64-pc-windows-msvc
-
-      - name: Copy sidecar binary
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path src-tauri/binaries
-          Copy-Item "target/aarch64-pc-windows-msvc/release/voice-typer.exe" -Destination "src-tauri/binaries/voice-typer-aarch64-pc-windows-msvc.exe"
-
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2" --locked
-
-      - name: Build Tauri app
-        run: cargo tauri build --target aarch64-pc-windows-msvc
-
-      - name: Upload NSIS installer
-        uses: actions/upload-artifact@v5
-        with:
-          name: voice-keyboard-windows-arm64-setup
-          path: src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*.exe
 
   # macOS Tauri GUI app (DMG)
   build-tauri-macos:
@@ -310,7 +206,7 @@ jobs:
       - name: Rename DMG
         run: |
           mkdir -p dist
-          mv target/${{ matrix.target }}/release/bundle/dmg/*.dmg dist/voice-keyboard-macos-${{ matrix.arch }}.dmg
+          mv src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg dist/voice-keyboard-macos-${{ matrix.arch }}.dmg
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -321,7 +217,7 @@ jobs:
   # Create GitHub Release
   release:
     if: github.event_name == 'push' || inputs.dry_run == false
-    needs: [build-windows, build-windows-arm, build-tauri-windows, build-tauri-windows-arm, build-tauri-macos, build-macos]
+    needs: [build-windows, build-tauri-windows, build-tauri-macos, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
