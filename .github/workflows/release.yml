@@ -91,6 +91,10 @@ jobs:
 
       # Build core app (voice-typer) with all features
       - name: Build voice-typer
+        env:
+          CC: clang-cl
+          CXX: clang-cl
+          CMAKE_GENERATOR: Ninja
         run: cargo build --release --bin voice-typer --features "whisper,opus,gui,updater" --target aarch64-pc-windows-msvc
 
       # Build launcher
@@ -184,6 +188,10 @@ jobs:
           key: windows-arm-tauri
 
       - name: Build voice-typer sidecar
+        env:
+          CC: clang-cl
+          CXX: clang-cl
+          CMAKE_GENERATOR: Ninja
         run: cargo build --release --bin voice-typer --features "whisper,opus" --target aarch64-pc-windows-msvc
 
       - name: Copy sidecar binary
