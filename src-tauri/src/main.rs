@@ -632,7 +632,7 @@ async fn open_github_issue(zip_path: String) -> Result<(), String> {
 /// Check macOS permissions: microphone, accessibility, input monitoring
 #[tauri::command]
 fn check_permissions() -> serde_json::Value {
-    let microphone = check_microphone_permission();
+    let microphone_status = mic_auth_status();
     let accessibility;
     let input_monitoring;
 
@@ -648,24 +648,65 @@ fn check_permissions() -> serde_json::Value {
     }
 
     serde_json::json!({
-        "microphone": microphone,
+        "microphone": microphone_status == "authorized",
+        "microphone_status": microphone_status,
         "accessibility": accessibility,
         "input_monitoring": input_monitoring,
     })
 }
 
-/// Check microphone permission.
-/// On macOS: always returns true — permission is enforced by macOS at stream creation time.
-/// If permission is denied, voice-typer will log an error when trying to record.
-fn check_microphone_permission() -> bool {
+/// Query current microphone authorization status via AVFoundation.
+/// Returns: "authorized" | "denied" | "restricted" | "not_determined"
+fn mic_auth_status() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        true
+        use objc2_av_foundation::{AVAuthorizationStatus, AVCaptureDevice, AVMediaTypeAudio};
+        unsafe {
+            let media_type = AVMediaTypeAudio.expect("AVMediaTypeAudio must exist");
+            match AVCaptureDevice::authorizationStatusForMediaType(media_type) {
+                AVAuthorizationStatus::Authorized => "authorized",
+                AVAuthorizationStatus::Denied => "denied",
+                AVAuthorizationStatus::Restricted => "restricted",
+                _ => "not_determined",
+            }
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
         use cpal::traits::HostTrait;
-        cpal::default_host().default_input_device().is_some()
+        if cpal::default_host().default_input_device().is_some() {
+            "authorized"
+        } else {
+            "denied"
+        }
+    }
+}
+
+/// Trigger the OS microphone permission dialog (no-op if already determined).
+/// Returns the status after the prompt resolves.
+#[tauri::command]
+async fn request_microphone_permission() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_av_foundation::{AVCaptureDevice, AVMediaTypeAudio};
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel::<bool>();
+        unsafe {
+            let media_type = AVMediaTypeAudio.expect("AVMediaTypeAudio must exist");
+            AVCaptureDevice::requestAccessForMediaType_completionHandler(
+                media_type,
+                &block2::StackBlock::new(move |granted: objc2::runtime::Bool| {
+                    let _ = tx.send(granted.as_bool());
+                }),
+            );
+        }
+        // Block until the user responds to the system dialog
+        let _ = rx.recv();
+        mic_auth_status().to_string()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        mic_auth_status().to_string()
     }
 }
 
@@ -682,12 +723,12 @@ fn restart_voice_typer(state: State<AppState>, app: AppHandle) -> Result<(), Str
     Ok(())
 }
 
-/// Open system privacy/security settings
+/// Open system privacy/security settings (microphone pane on macOS)
 #[tauri::command]
 fn open_privacy_settings() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        open::that("x-apple.systempreferences:com.apple.preference.security?Privacy")
+        open::that("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
             .map_err(|e| e.to_string())
     }
     #[cfg(target_os = "windows")]
@@ -1917,6 +1958,7 @@ fn main() {
             create_debug_report,
             open_github_issue,
             check_permissions,
+            request_microphone_permission,
             open_privacy_settings,
             restart_voice_typer,
             get_audio_devices,

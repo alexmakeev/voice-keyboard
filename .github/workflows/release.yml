@@ -161,11 +161,11 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             arch: arm64
-            features: "whisper,metal"
+            features: "whisper,metal,opus"
           - os: macos-15-intel
             target: x86_64-apple-darwin
             arch: x64
-            features: "whisper"
+            features: "whisper,opus"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -197,16 +197,31 @@ jobs:
           mkdir -p src-tauri/binaries
           cp target/${{ matrix.target }}/release/voice-typer src-tauri/binaries/voice-typer-${{ matrix.target }}
 
-      - name: Build Tauri DMG
-        run: cargo tauri build --target ${{ matrix.target }} --bundles dmg
+      - name: Build Tauri app bundle
+        run: cargo tauri build --target ${{ matrix.target }} --bundles app
         env:
           APPLE_SIGNING_IDENTITY: "-"
           CI: true
 
-      - name: Rename DMG
+      - name: Re-sign app bundle with entitlements
         run: |
+          APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Voice Keyboard.app"
+          SIDECAR="${APP}/Contents/MacOS/voice-typer"
+          ENTITLEMENTS="src-tauri/entitlements.plist"
+          # Re-sign sidecar first so the bundle signature covers it
+          codesign --force --sign - --entitlements "${ENTITLEMENTS}" --options runtime "${SIDECAR}"
+          # Re-sign the bundle (deep covers all nested binaries)
+          codesign --force --deep --sign - --entitlements "${ENTITLEMENTS}" --options runtime "${APP}"
+          # Verify
+          codesign --verify --deep --strict "${APP}"
+          codesign -d --entitlements - "${APP}"
+
+      - name: Package DMG from signed app
+        run: |
+          APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Voice Keyboard.app"
           mkdir -p dist
-          mv src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg dist/voice-keyboard-macos-${{ matrix.arch }}.dmg
+          hdiutil create -volname "Voice Keyboard" -srcfolder "${APP}" -ov -format UDZO \
+            "dist/voice-keyboard-macos-${{ matrix.arch }}.dmg"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

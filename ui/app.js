@@ -914,9 +914,25 @@ function stopStatusPolling() {
 async function checkPermissions() {
     try {
         const perms = await invoke('check_permissions');
+
+        // If the OS hasn't asked the user yet, trigger the system dialog now
+        // so they see it at startup rather than on first hotkey press
+        if (perms.microphone_status === 'not_determined') {
+            await invoke('request_microphone_permission');
+            // Re-fetch after the dialog resolves
+            return checkPermissions();
+        }
+
         updatePermissionItem('perm-microphone', perms.microphone);
         updatePermissionItem('perm-accessibility', perms.accessibility);
         updatePermissionItem('perm-input_monitoring', perms.input_monitoring);
+
+        const micBlocked = perms.microphone_status === 'denied' || perms.microphone_status === 'restricted';
+        if (micBlocked) {
+            showMicDeniedBanner();
+        } else {
+            hideMicDeniedBanner();
+        }
 
         if (perms.microphone && perms.accessibility && perms.input_monitoring) {
             elements.permissionsModal.classList.add('hidden');
@@ -926,6 +942,23 @@ async function checkPermissions() {
     } catch (e) {
         console.error('Failed to check permissions:', e);
     }
+}
+
+function showMicDeniedBanner() {
+    let banner = document.getElementById('mic-denied-banner');
+    if (!banner) {
+        banner = document.createElement('div');
+        banner.id = 'mic-denied-banner';
+        banner.style.cssText = 'background:#c0392b;color:#fff;padding:10px 16px;text-align:center;font-size:13px;';
+        banner.innerHTML = 'Voice Keyboard needs microphone access. Open <strong>System Settings → Privacy &amp; Security → Microphone</strong> and enable Voice Keyboard. <button onclick="invoke(\'open_privacy_settings\')" style="margin-left:8px;padding:2px 8px;cursor:pointer;">Open Settings</button>';
+        document.body.insertBefore(banner, document.body.firstChild);
+    }
+    banner.style.display = '';
+}
+
+function hideMicDeniedBanner() {
+    const banner = document.getElementById('mic-denied-banner');
+    if (banner) banner.style.display = 'none';
 }
 
 function updatePermissionItem(elementId, granted) {
