@@ -10,6 +10,9 @@
 //! To skip if model not available:
 //!   cargo test --test transcription_test -- --ignored
 
+// Requires the `whisper` feature; skip compilation entirely without it.
+#![cfg(feature = "whisper")]
+
 use std::path::PathBuf;
 use voice_keyboard::transcribe::Transcriber;
 
