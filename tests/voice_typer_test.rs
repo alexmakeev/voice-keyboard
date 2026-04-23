@@ -4,7 +4,6 @@
 
 /// Sample rate constants (matching voice_typer.rs)
 const RECORDING_SAMPLE_RATE: u32 = 48000;
-const WHISPER_SAMPLE_RATE: u32 = 16000;
 
 /// VAD constants (matching voice_typer.rs)
 const VAD_ENERGY_THRESHOLD: f32 = 0.001;
@@ -749,7 +748,7 @@ fn test_concatenation_workflow() {
     // 2. Continuation: "...который проверяет"
     // 3. Another phrase: "Новое предложение."
 
-    let mut context = String::new();
+    let mut context: String;
 
     // First phrase
     let phrase1 = "Привет, это тест.";

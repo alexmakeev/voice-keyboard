@@ -10,7 +10,7 @@
 //! To skip if model not available:
 //!   cargo test --test transcription_test -- --ignored
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use voice_keyboard::transcribe::Transcriber;
 
 fn get_model_path() -> Option<PathBuf> {
@@ -143,7 +143,7 @@ fn bench_transcription_speed() {
 
     for i in 0..iterations {
         let start = std::time::Instant::now();
-        let result = transcriber
+        let _ = transcriber
             .transcribe_file(&audio_path)
             .expect("Transcription failed");
         let elapsed = start.elapsed().as_millis() as u64;

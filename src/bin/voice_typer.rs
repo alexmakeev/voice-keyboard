@@ -170,6 +170,7 @@ fn get_openai_prompt() -> String {
 }
 
 /// Get the maximum recording duration from environment or use default
+#[cfg(target_os = "macos")]
 fn max_recording_duration() -> Duration {
     let secs = std::env::var("VOICE_KEYBOARD_MAX_RECORDING_SECS")
         .ok()
@@ -1579,7 +1580,7 @@ fn transcribe_openai_internal(
     prompt: Option<&str>,
     use_ogg: bool,
 ) -> Result<(String, String), String> {
-    let mut last_error = String::new();
+    let mut last_error: String;
 
     // First attempt
     match transcribe_openai_single_attempt(config, samples, sample_rate, prompt, use_ogg) {
@@ -2571,8 +2572,6 @@ fn main() {
     let config = load_config();
     let args: Vec<String> = env::args().collect();
     let mut model_arg: Option<String> = config.model.clone();
-    let mut use_openai = false;
-    let mut use_openrouter = false;
     let mut backend_order: Vec<BackendKind> = Vec::new();
     let mut cli_mode = false; // CLI mode (advanced, requires --cli flag)
 
@@ -2669,13 +2668,11 @@ fn main() {
                 input_method = InputMethod::Keyboard;
             }
             "--openai" => {
-                use_openai = true;
                 if !backend_order.contains(&BackendKind::OpenAI) {
                     backend_order.push(BackendKind::OpenAI);
                 }
             }
             "--openrouter" => {
-                use_openrouter = true;
                 if !backend_order.contains(&BackendKind::OpenRouter) {
                     backend_order.push(BackendKind::OpenRouter);
                 }
@@ -2883,6 +2880,9 @@ fn main() {
         launch_gui();
         return;
     }
+    // cli_mode is only meaningful when the `gui` feature is active; suppress unused warning
+    #[cfg(not(feature = "gui"))]
+    let _ = cli_mode;
 
     // CLI mode continues below...
     let input_mode_str = match input_method {
