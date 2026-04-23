@@ -126,8 +126,8 @@ jobs:
         with:
           key: macos-tauri
 
-      - name: Install autotools
-        run: brew install autoconf automake libtool
+      - name: Install macOS dependencies
+        run: brew install autoconf automake libtool opus pkg-config
 
       - name: Build voice-typer sidecar
         env:
@@ -179,6 +179,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}-release
+
+      - name: Install macOS dependencies
+        run: brew install opus pkg-config
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
