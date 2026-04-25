@@ -140,7 +140,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             model: "large-v3-turbo".to_string(),
-            language: "ru".to_string(),
+            language: "auto".to_string(),
             hotkey: "fn".to_string(),
             input_method: "keyboard".to_string(),
             openai_api_key: String::new(),
@@ -1649,8 +1649,12 @@ fn extract_status(line: &str) -> Option<(&'static str, String)> {
     }
     if lower.contains("cannot connect") || (lower.contains("not found") && lower.contains("model"))
         || (lower.contains("error") && lower.contains("exit"))
+        || (lower.contains("[error]") && lower.contains("no openai api key"))
+        || (lower.contains("[error]") && lower.contains("no openrouter api key"))
     {
-        return Some(("error", "Error".into()));
+        // Preserve original line as reason so frontend can display it
+        let reason = line.trim().to_string();
+        return Some(("error", reason));
     }
     None
 }
