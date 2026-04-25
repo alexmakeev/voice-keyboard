@@ -171,7 +171,6 @@ fn get_openai_prompt() -> String {
 }
 
 /// Get the maximum recording duration from environment or use default
-#[cfg(target_os = "macos")]
 fn max_recording_duration() -> Duration {
     let secs = std::env::var("VOICE_KEYBOARD_MAX_RECORDING_SECS")
         .ok()
