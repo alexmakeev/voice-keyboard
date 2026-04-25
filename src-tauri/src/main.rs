@@ -1297,9 +1297,15 @@ async fn install_update_windows(
     ).await?;
 
     // Launch the NSIS installer with /S (silent install)
-    Command::new(&installer_path)
-        .arg("/S")
-        .spawn()
+    let mut installer_cmd = Command::new(&installer_path);
+    installer_cmd.arg("/S");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        installer_cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    installer_cmd.spawn()
         .map_err(|e| {
             let _ = fs::remove_file(&installer_path);
             format!("Failed to launch installer: {}", e)
@@ -1418,9 +1424,15 @@ async fn perform_auto_update_windows(
     tracing::info!("[update] perform_auto_update: launching installer {}", installer_path.display());
 
     // Launch NSIS installer with /S (silent install)
-    Command::new(&installer_path)
-        .arg("/S")
-        .spawn()
+    let mut installer_cmd = Command::new(&installer_path);
+    installer_cmd.arg("/S");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        installer_cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    installer_cmd.spawn()
         .map_err(|e| {
             let _ = fs::remove_file(&installer_path);
             format!("Failed to launch installer: {}", e)
@@ -1873,6 +1885,16 @@ fn stop_voice_typer(state: &AppState) {
 // ============================================================================
 
 fn main() {
+    // Defensive: detach from any inherited/allocated console on Windows.
+    // FreeConsole returns 0 if no console was attached (safe to ignore).
+    #[cfg(target_os = "windows")]
+    {
+        extern "system" {
+            fn FreeConsole() -> i32;
+        }
+        unsafe { FreeConsole(); }
+    }
+
     // Load config
     let config = load_config();
 

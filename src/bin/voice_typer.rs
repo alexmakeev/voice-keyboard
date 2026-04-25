@@ -2613,6 +2613,17 @@ fn download_model_with_fallback(model_name: &str) -> Result<PathBuf, String> {
 // ============================================================================
 
 fn main() {
+    // Defensive: detach from any inherited/allocated console on Windows.
+    // Must run before any other operations to prevent console window flicker.
+    // FreeConsole returns 0 if no console was attached (safe to ignore).
+    #[cfg(target_os = "windows")]
+    {
+        extern "system" {
+            fn FreeConsole() -> i32;
+        }
+        unsafe { FreeConsole(); }
+    }
+
     // Load .env early so VOICE_KEYBOARD_* vars are available before any env::var calls
     let _ = dotenvy::dotenv();
     let env_path = get_data_dir().join(".env");
@@ -4703,18 +4714,29 @@ impl DevReport {
             "{}:{}/{}",
             DEV_REPORT_SERVER, DEV_REPORT_PATH, self.session_id
         );
-        let _ = Command::new("ssh")
-            .arg(DEV_REPORT_SERVER)
-            .arg(format!("mkdir -p {}/{}", DEV_REPORT_PATH, self.session_id))
-            .output();
+        let mut ssh_cmd = Command::new("ssh");
+        ssh_cmd.arg(DEV_REPORT_SERVER)
+            .arg(format!("mkdir -p {}/{}", DEV_REPORT_PATH, self.session_id));
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            ssh_cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let _ = ssh_cmd.output();
 
         // Upload only JSON report (no audio files - they stay local)
         let json_path = self.report_dir.join("report.json");
         if json_path.exists() {
-            match Command::new("scp")
-                .arg(&json_path)
-                .arg(&mkdir_dest)
-                .output()
+            let mut scp_cmd = Command::new("scp");
+            scp_cmd.arg(&json_path).arg(&mkdir_dest);
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x08000000;
+                scp_cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            match scp_cmd.output()
             {
                 Ok(output) => {
                     if output.status.success() {
