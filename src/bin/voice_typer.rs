@@ -373,6 +373,56 @@ fn start_hotkey_listener(
     }
     #[cfg(not(target_os = "macos"))]
     {
+        // Windows/Linux watchdog: on non-macOS there is no grab_fn timeout recovery.
+        // This background thread checks every second whether a recording has been running
+        // for longer than max_recording_duration(). If so, it force-resets state to Idle,
+        // pauses the audio stream, and restores system volume — equivalent to what the
+        // macOS grab_fn timeout does on each key event, but as a proactive periodic check.
+        //
+        // Note: key_debounce (inside the callback closure) cannot be reset here. However,
+        // the KeyPress handler now detects stale debounce (state=Idle but debounce=true)
+        // and allows the next press to proceed, so recovery works correctly after this reset.
+        let max_rec = max_recording_duration();
+        let state_wd = Arc::clone(&state);
+        let recording_start_wd = Arc::clone(&recording_start);
+        let is_recording_wd = Arc::clone(&is_recording);
+        let persistent_stream_wd = Arc::clone(&persistent_stream);
+        let volume_controller_wd = Arc::clone(&volume_controller);
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                let rec_state = state_wd.lock().unwrap();
+                if *rec_state == RecordingState::Recording {
+                    let timed_out = recording_start_wd
+                        .lock()
+                        .unwrap()
+                        .map(|start| start.elapsed() > max_rec)
+                        .unwrap_or(false);
+                    if timed_out {
+                        drop(rec_state);
+                        eprintln!(
+                            "[watchdog] WARNING: Recording timeout ({}s) — force-stopping stuck recording",
+                            max_rec.as_secs()
+                        );
+                        is_recording_wd.store(false, std::sync::atomic::Ordering::SeqCst);
+                        *state_wd.lock().unwrap() = RecordingState::Idle;
+                        *recording_start_wd.lock().unwrap() = None;
+
+                        // Pause audio stream
+                        {
+                            let stream_guard = persistent_stream_wd.lock().unwrap();
+                            if let Some(ref stream) = *stream_guard {
+                                let _ = stream.pause();
+                            }
+                        }
+
+                        // Restore system volume
+                        volume_controller_wd.restore();
+                    }
+                }
+            }
+        });
+
         if let Err(e) = listen(callback) {
             eprintln!("Error: {:?}", e);
 
@@ -6120,9 +6170,9 @@ fn run_openai(
     let callback = move |event: Event| {
         use std::sync::atomic::Ordering;
 
-        // NOTE: Recording timeout (120s) is handled by start_hotkey_listener's grab_fn.
-        // It resets state to Idle, pauses the stream, and restores volume before the
-        // event reaches this callback.
+        // NOTE: Recording timeout (120s) is handled by start_hotkey_listener:
+        // - macOS: via grab_fn (triggered on any keyboard event)
+        // - Windows/Linux: via watchdog thread (proactive 1-second polling)
 
         match event.event_type {
             EventType::KeyPress(key)
@@ -6154,16 +6204,27 @@ fn run_openai(
                         // Restore system volume
                         volume_controller_clone.restore();
 
-                        // Reset debounce so the next press starts fresh
+                        // Reset debounce and fall through to start a new recording.
+                        // Do NOT return here — the current press should immediately
+                        // start a fresh recording so the user doesn't need an extra press.
                         key_debounce_clone.store(false, Ordering::SeqCst);
-                        // Small delay before allowing a new recording
+                        // Small delay before starting a new recording
                         thread::sleep(Duration::from_millis(200));
-                        return;
+                        // Fall through — state is now Idle, debounce is false
                     }
                 }
 
+                // Debounce: ignore key-repeat events while recording.
+                // Exception: if debounce is true but state is Idle, the debounce is
+                // stale (e.g., leftover after watchdog timeout recovery that reset state
+                // without going through KeyRelease). Allow the press to proceed.
                 if key_debounce_clone.swap(true, Ordering::SeqCst) {
-                    return; // Already pressed, ignore repeat
+                    let rec_state = state_clone.lock().unwrap();
+                    if *rec_state == RecordingState::Recording {
+                        return; // Genuine key-repeat while recording — ignore
+                    }
+                    // state is Idle — debounce is stale, proceed with new recording
+                    // key_debounce is already true (set by swap above), which is correct
                 }
 
                 // Check for pending retry job first
