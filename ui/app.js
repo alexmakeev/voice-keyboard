@@ -177,6 +177,26 @@ function setupTabs() {
 }
 
 function setupEventListeners() {
+    // Record button: push-to-talk via mouse (for testing without working hotkey)
+    const recBtn = elements.hotkeyState;
+    if (recBtn) {
+        const stopRecording = async () => {
+            try { await invoke('test_recording_stop'); } catch (e) { console.error('test_recording_stop failed:', e); }
+        };
+        recBtn.addEventListener('mousedown', async (e) => {
+            e.preventDefault();
+            try { await invoke('test_recording_start'); } catch (e) { console.error('test_recording_start failed:', e); }
+        });
+        recBtn.addEventListener('mouseup', stopRecording);
+        recBtn.addEventListener('mouseleave', stopRecording);
+        // Touch support (optional, desktop-primary)
+        recBtn.addEventListener('touchstart', async (e) => {
+            e.preventDefault();
+            try { await invoke('test_recording_start'); } catch (e) { console.error('test_recording_start failed:', e); }
+        }, { passive: false });
+        recBtn.addEventListener('touchend', stopRecording);
+    }
+
     // Clear debug log
     elements.clearDebugBtn.addEventListener('click', async () => {
         debugLines = [];

@@ -6177,6 +6177,7 @@ fn run_openai(
     let vad_clone = Arc::clone(&vad);
     let next_sequence_clone = Arc::clone(&next_sequence);
     let processing_count_clone = Arc::clone(&processing_count);
+    let job_tx_stdin = job_tx.clone(); // cloned for stdin reader thread (below callback)
     let job_tx_callback = job_tx;
     let dev_report_callback = Arc::clone(&dev_report);
     let config_callback = Arc::clone(&config);
@@ -6705,6 +6706,272 @@ fn run_openai(
         println!("  1. Install: vcpkg install opus");
         println!("  2. Rebuild: cargo build --features opus");
         println!("");
+    }
+
+    // Stdin reader thread: receives TEST_PRESS / TEST_RELEASE commands from Tauri
+    // when user clicks the big record button in the UI (mouse-based push-to-talk).
+    // Uses SendCallback wrapper on macOS because cpal::Stream is !Send on CoreAudio.
+    {
+        use std::sync::atomic::Ordering;
+        let state_stdin = Arc::clone(&state);
+        let is_recording_stdin = Arc::clone(&is_recording);
+        let persistent_stream_stdin = Arc::clone(&persistent_stream);
+        let volume_controller_stdin = Arc::clone(&volume_controller);
+        let recording_start_stdin = Arc::clone(&recording_start);
+        let samples_stdin = Arc::clone(&samples);
+        let vad_stdin = Arc::clone(&vad);
+        let next_sequence_stdin = Arc::clone(&next_sequence);
+        let processing_count_stdin = Arc::clone(&processing_count);
+        let output_mode_stdin = Arc::clone(&output_mode);
+        let active_preprompt_stdin = Arc::clone(&active_preprompt_index);
+
+        #[cfg(target_os = "macos")]
+        let worker = SendCallback(move || {
+            use std::io::BufRead;
+            let stdin_handle = std::io::stdin();
+            for line in stdin_handle.lock().lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                eprintln!("[HOTKEY] stdin command received: {}", line.trim());
+                match line.trim() {
+                    "TEST_PRESS" => {
+                        let mut rec_state = state_stdin.lock().unwrap();
+                        if *rec_state == RecordingState::Recording {
+                            eprintln!("[HOTKEY] stdin TEST_PRESS: force-reset (was Recording)");
+                            is_recording_stdin.store(false, Ordering::SeqCst);
+                            *rec_state = RecordingState::Idle;
+                            drop(rec_state);
+                            {
+                                let sg = persistent_stream_stdin.lock().unwrap();
+                                if let Some(ref s) = *sg { let _ = s.pause(); }
+                            }
+                            volume_controller_stdin.restore();
+                            thread::sleep(Duration::from_millis(200));
+                            rec_state = state_stdin.lock().unwrap();
+                        }
+                        if *rec_state == RecordingState::Idle {
+                            samples_stdin.lock().unwrap().clear();
+                            vad_stdin.lock().unwrap().reset();
+                            next_sequence_stdin.store(0, Ordering::SeqCst);
+                            active_preprompt_stdin.store(0, Ordering::SeqCst);
+                            *recording_start_stdin.lock().unwrap() = Some(Instant::now());
+                            is_recording_stdin.store(true, Ordering::SeqCst);
+                            *rec_state = RecordingState::Recording;
+                            drop(rec_state);
+                            {
+                                let sg = persistent_stream_stdin.lock().unwrap();
+                                if let Some(ref s) = *sg {
+                                    if let Err(e) = s.play() {
+                                        eprintln!("[HOTKEY] stdin: failed to play stream: {}", e);
+                                        is_recording_stdin.store(false, Ordering::SeqCst);
+                                        *state_stdin.lock().unwrap() = RecordingState::Idle;
+                                        continue;
+                                    }
+                                }
+                            }
+                            volume_controller_stdin.lower();
+                            eprintln!("[HOTKEY] stdin: recording STARTED via TEST_PRESS");
+                            println!("[{}] Recording...", timestamp());
+                            std::io::stdout().flush().ok();
+                        }
+                    }
+                    "TEST_RELEASE" => {
+                        let mut rec_state = state_stdin.lock().unwrap();
+                        if *rec_state == RecordingState::Recording {
+                            is_recording_stdin.store(false, Ordering::SeqCst);
+                            *rec_state = RecordingState::Idle;
+                            eprintln!("[HOTKEY] stdin: recording STOPPED via TEST_RELEASE");
+                            drop(rec_state);
+                            {
+                                let sg = persistent_stream_stdin.lock().unwrap();
+                                if let Some(ref s) = *sg { let _ = s.pause(); }
+                            }
+                            volume_controller_stdin.restore();
+
+                            let recording_duration = recording_start_stdin
+                                .lock()
+                                .unwrap()
+                                .map(|start| start.elapsed())
+                                .unwrap_or(Duration::ZERO);
+
+                            if recording_duration < Duration::from_millis(min_recording_ms) {
+                                println!("[{}] Recording too short, ignoring", timestamp());
+                                std::io::stdout().flush().ok();
+                                continue;
+                            }
+
+                            let phrase_opt = {
+                                let smp = samples_stdin.lock().unwrap();
+                                if !smp.is_empty() {
+                                    let duration_ms =
+                                        smp.len() as f32 / RECORDING_SAMPLE_RATE as f32 * 1000.0;
+                                    println!(
+                                        "[VAD] stdin-release: sending full audio ({:.0}ms)",
+                                        duration_ms
+                                    );
+                                    Some((smp.clone(), 0usize, smp.len()))
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some((phrase_samples, start_pos, end_pos)) = phrase_opt {
+                                let seq = next_sequence_stdin.fetch_add(1, Ordering::SeqCst);
+                                processing_count_stdin.fetch_add(1, Ordering::SeqCst);
+                                let current_mode = output_mode_stdin.load(Ordering::SeqCst);
+                                let current_preprompt =
+                                    active_preprompt_stdin.load(Ordering::SeqCst);
+                                let _ = job_tx_stdin.send(TranscriptionJob {
+                                    samples: phrase_samples,
+                                    sequence_num: seq,
+                                    start_sample: start_pos,
+                                    end_sample: end_pos,
+                                    output_mode: current_mode,
+                                    selected_text: None,
+                                    preprompt_index: current_preprompt,
+                                    #[cfg(target_os = "macos")]
+                                    target_pid: None,
+                                });
+                                println!(
+                                    "[{}] stdin-release: queued audio (seq={})",
+                                    timestamp(), seq
+                                );
+                                std::io::stdout().flush().ok();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            eprintln!("[HOTKEY] stdin reader thread exiting (EOF)");
+        });
+        #[cfg(target_os = "macos")]
+        thread::spawn(move || worker.run());
+
+        #[cfg(not(target_os = "macos"))]
+        thread::spawn(move || {
+            use std::io::BufRead;
+            let stdin_handle = std::io::stdin();
+            for line in stdin_handle.lock().lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                eprintln!("[HOTKEY] stdin command received: {}", line.trim());
+                match line.trim() {
+                    "TEST_PRESS" => {
+                        let mut rec_state = state_stdin.lock().unwrap();
+                        if *rec_state == RecordingState::Recording {
+                            eprintln!("[HOTKEY] stdin TEST_PRESS: force-reset (was Recording)");
+                            is_recording_stdin.store(false, Ordering::SeqCst);
+                            *rec_state = RecordingState::Idle;
+                            drop(rec_state);
+                            {
+                                let sg = persistent_stream_stdin.lock().unwrap();
+                                if let Some(ref s) = *sg { let _ = s.pause(); }
+                            }
+                            volume_controller_stdin.restore();
+                            thread::sleep(Duration::from_millis(200));
+                            rec_state = state_stdin.lock().unwrap();
+                        }
+                        if *rec_state == RecordingState::Idle {
+                            samples_stdin.lock().unwrap().clear();
+                            vad_stdin.lock().unwrap().reset();
+                            next_sequence_stdin.store(0, Ordering::SeqCst);
+                            active_preprompt_stdin.store(0, Ordering::SeqCst);
+                            *recording_start_stdin.lock().unwrap() = Some(Instant::now());
+                            is_recording_stdin.store(true, Ordering::SeqCst);
+                            *rec_state = RecordingState::Recording;
+                            drop(rec_state);
+                            {
+                                let sg = persistent_stream_stdin.lock().unwrap();
+                                if let Some(ref s) = *sg {
+                                    if let Err(e) = s.play() {
+                                        eprintln!("[HOTKEY] stdin: failed to play stream: {}", e);
+                                        is_recording_stdin.store(false, Ordering::SeqCst);
+                                        *state_stdin.lock().unwrap() = RecordingState::Idle;
+                                        continue;
+                                    }
+                                }
+                            }
+                            volume_controller_stdin.lower();
+                            eprintln!("[HOTKEY] stdin: recording STARTED via TEST_PRESS");
+                            println!("[{}] Recording...", timestamp());
+                            std::io::stdout().flush().ok();
+                        }
+                    }
+                    "TEST_RELEASE" => {
+                        let mut rec_state = state_stdin.lock().unwrap();
+                        if *rec_state == RecordingState::Recording {
+                            is_recording_stdin.store(false, Ordering::SeqCst);
+                            *rec_state = RecordingState::Idle;
+                            eprintln!("[HOTKEY] stdin: recording STOPPED via TEST_RELEASE");
+                            drop(rec_state);
+                            {
+                                let sg = persistent_stream_stdin.lock().unwrap();
+                                if let Some(ref s) = *sg { let _ = s.pause(); }
+                            }
+                            volume_controller_stdin.restore();
+
+                            let recording_duration = recording_start_stdin
+                                .lock()
+                                .unwrap()
+                                .map(|start| start.elapsed())
+                                .unwrap_or(Duration::ZERO);
+
+                            if recording_duration < Duration::from_millis(min_recording_ms) {
+                                println!("[{}] Recording too short, ignoring", timestamp());
+                                std::io::stdout().flush().ok();
+                                continue;
+                            }
+
+                            let phrase_opt = {
+                                let smp = samples_stdin.lock().unwrap();
+                                if !smp.is_empty() {
+                                    let duration_ms =
+                                        smp.len() as f32 / RECORDING_SAMPLE_RATE as f32 * 1000.0;
+                                    println!(
+                                        "[VAD] stdin-release: sending full audio ({:.0}ms)",
+                                        duration_ms
+                                    );
+                                    Some((smp.clone(), 0usize, smp.len()))
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some((phrase_samples, start_pos, end_pos)) = phrase_opt {
+                                let seq = next_sequence_stdin.fetch_add(1, Ordering::SeqCst);
+                                processing_count_stdin.fetch_add(1, Ordering::SeqCst);
+                                let current_mode = output_mode_stdin.load(Ordering::SeqCst);
+                                let current_preprompt =
+                                    active_preprompt_stdin.load(Ordering::SeqCst);
+                                let _ = job_tx_stdin.send(TranscriptionJob {
+                                    samples: phrase_samples,
+                                    sequence_num: seq,
+                                    start_sample: start_pos,
+                                    end_sample: end_pos,
+                                    output_mode: current_mode,
+                                    selected_text: None,
+                                    preprompt_index: current_preprompt,
+                                    #[cfg(target_os = "macos")]
+                                    target_pid: None,
+                                });
+                                println!(
+                                    "[{}] stdin-release: queued audio (seq={})",
+                                    timestamp(), seq
+                                );
+                                std::io::stdout().flush().ok();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            eprintln!("[HOTKEY] stdin reader thread exiting (EOF)");
+        });
     }
 
     start_hotkey_listener(

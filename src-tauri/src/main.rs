@@ -75,6 +75,8 @@ struct AppState {
     config: Arc<Mutex<AppConfig>>,
     /// Background voice-typer process
     voice_typer: Arc<Mutex<Option<Child>>>,
+    /// Stdin pipe to voice-typer (for TEST_PRESS / TEST_RELEASE commands)
+    voice_typer_stdin: Arc<Mutex<Option<std::process::ChildStdin>>>,
     /// Last known status (for polling from frontend)
     last_status: Arc<Mutex<serde_json::Value>>,
     /// Cached update info from last check
@@ -708,6 +710,28 @@ async fn request_microphone_permission() -> String {
     {
         mic_auth_status().to_string()
     }
+}
+
+/// Send TEST_PRESS command to voice-typer stdin (simulates hotkey press via mouse button)
+#[tauri::command]
+fn test_recording_start(state: State<AppState>) -> Result<(), String> {
+    let mut guard = state.voice_typer_stdin.lock().unwrap();
+    if let Some(ref mut stdin) = *guard {
+        writeln!(stdin, "TEST_PRESS").map_err(|e| e.to_string())?;
+        stdin.flush().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Send TEST_RELEASE command to voice-typer stdin (simulates hotkey release via mouse button)
+#[tauri::command]
+fn test_recording_stop(state: State<AppState>) -> Result<(), String> {
+    let mut guard = state.voice_typer_stdin.lock().unwrap();
+    if let Some(ref mut stdin) = *guard {
+        writeln!(stdin, "TEST_RELEASE").map_err(|e| e.to_string())?;
+        stdin.flush().map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Restart voice-typer process (stop + start)
@@ -1472,7 +1496,7 @@ fn spawn_voice_typer(config: &AppConfig) -> Result<Child, String> {
     let path = find_voice_typer_path()?;
 
     let mut cmd = Command::new(&path);
-    cmd.stdin(Stdio::null())
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -1715,10 +1739,15 @@ fn start_voice_typer(state: &AppState, app: &AppHandle) {
 
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
+            // Take stdin before storing child (child moves into guard below)
+            let child_stdin = child.stdin.take();
 
             *guard = Some(child);
             // Drop the lock before spawning threads
             drop(guard);
+
+            // Store stdin for test_recording_start/stop commands
+            *state.voice_typer_stdin.lock().unwrap() = child_stdin;
 
             // Spawn stdout reader thread
             if let Some(stdout) = stdout {
@@ -1830,6 +1859,8 @@ fn start_voice_typer(state: &AppState, app: &AppHandle) {
 
 /// Kill the background voice-typer process and wait for it to exit
 fn stop_voice_typer(state: &AppState) {
+    // Drop stdin first so voice-typer sees EOF on its stdin reader
+    *state.voice_typer_stdin.lock().unwrap() = None;
     let mut guard = state.voice_typer.lock().unwrap();
     if let Some(mut child) = guard.take() {
         let _ = child.kill();
@@ -1853,6 +1884,7 @@ fn main() {
         transcriptions: Arc::new(Mutex::new(Vec::new())),
         config: Arc::new(Mutex::new(config)),
         voice_typer: Arc::new(Mutex::new(None)),
+        voice_typer_stdin: Arc::new(Mutex::new(None)),
         last_status: Arc::new(Mutex::new(serde_json::json!({"status": "connecting", "text": "Starting..."}))),
         update_info: Arc::new(Mutex::new(None)),
     };
@@ -1977,6 +2009,8 @@ fn main() {
             check_for_update,
             install_update,
             perform_auto_update,
+            test_recording_start,
+            test_recording_stop,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
