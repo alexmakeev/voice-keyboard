@@ -233,20 +233,20 @@ enum RecordingState {
 
 /// Wrapper to move non-Send closures to a worker thread.
 ///
-/// The grab_fn callback passed to `rdev::grab` on macOS captures `cpal::Stream`
-/// (via `Arc<Mutex<Option<Stream>>>`), which is `!Send` due to internal raw pointers.
-/// However, the stream is always accessed through the Mutex, providing safe synchronization.
-/// The worker thread processes events sequentially, so there is no concurrent access.
+/// The hotkey callback captures `cpal::Stream` (via `Arc<Mutex<Option<Stream>>>`),
+/// which is `!Send` due to internal raw pointers. However, the stream is always
+/// accessed through the Mutex, providing safe synchronization. The worker thread
+/// processes events sequentially, so there is no concurrent access.
 ///
 /// SAFETY: The wrapped value is only ever accessed from a single worker thread.
 /// All shared state inside the closure is behind Arc<Mutex<..>> or Arc<AtomicBool>.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 struct SendCallback<F>(F);
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 unsafe impl<F> Send for SendCallback<F> {}
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl<F: FnOnce()> SendCallback<F> {
     fn run(self) {
         (self.0)();
@@ -423,21 +423,46 @@ fn start_hotkey_listener(
             }
         });
 
-        if let Err(e) = listen(callback) {
-            eprintln!("Error: {:?}", e);
+        // Windows: rdev::listen runs the callback on the OS WH_KEYBOARD_LL hook
+        // thread, which has a strict timeout (LowLevelHooksTimeout, ~5s). The
+        // callback does heavy work (waits up to 10s for previous transcription,
+        // spawns powershell for volume control, etc.), so we offload it to a
+        // worker thread via a channel — same pattern as macOS grab_fn.
+        //
+        // Linux uses listen(callback) directly: rdev's X11 listener runs in its
+        // own thread already, no hook timeout, so direct invocation is fine.
+        #[cfg(target_os = "windows")]
+        {
+            let (event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
 
-            #[cfg(target_os = "linux")]
-            {
+            #[allow(unused_mut)]
+            let mut callback = callback;
+            let send_worker = SendCallback(move || {
+                while let Ok(event) = event_rx.recv() {
+                    callback(event);
+                }
+            });
+            thread::spawn(move || send_worker.run());
+
+            let forward = move |event: Event| {
+                let _ = event_tx.send(event);
+            };
+
+            if let Err(e) = listen(forward) {
+                eprintln!("Error: {:?}", e);
+                eprintln!("\nOn Windows, try running as Administrator.");
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            if let Err(e) = listen(callback) {
+                eprintln!("Error: {:?}", e);
                 eprintln!();
                 eprintln!("On Linux, make sure you have the necessary permissions.");
                 eprintln!("Try running with sudo or adding your user to the 'input' group:");
                 eprintln!("  sudo usermod -aG input $USER");
                 eprintln!("Then log out and back in.");
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                eprintln!("\nOn Windows, try running as Administrator.");
             }
         }
     }
@@ -6217,6 +6242,15 @@ fn run_openai(
     let key_debounce = Arc::new(AtomicBool::new(false));
     let key_debounce_clone = Arc::clone(&key_debounce);
 
+    // Auto-repeat suppression: Windows fires WM_KEYDOWN every ~30ms while a
+    // key is held (modifiers included on many systems). Without this filter
+    // each repeat hits the "force-reset on Recording" path below and bounces
+    // the recording state Idle→Recording every 200ms, drowning the actual
+    // KeyRelease in the queue. We treat any press within 250ms of the
+    // previous one as auto-repeat and ignore it.
+    let last_press_instant: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let last_press_instant_clone = Arc::clone(&last_press_instant);
+
     let callback = move |event: Event| {
         use std::sync::atomic::Ordering;
 
@@ -6259,6 +6293,25 @@ fn run_openai(
             {
                 // #3: trigger_key matched (press)
                 eprintln!("[HOTKEY] trigger_key matched: action=press key={:?}", key);
+
+                // Auto-repeat filter: drop the event if the previous press
+                // landed less than 250ms ago. See last_press_instant comment
+                // above the callback for context.
+                {
+                    let now = Instant::now();
+                    let mut last = last_press_instant_clone.lock().unwrap();
+                    if let Some(prev) = *last {
+                        if now.duration_since(prev) < Duration::from_millis(250) {
+                            eprintln!(
+                                "[HOTKEY] auto-repeat suppressed ({}ms since last press)",
+                                now.duration_since(prev).as_millis()
+                            );
+                            *last = Some(now);
+                            return;
+                        }
+                    }
+                    *last = Some(now);
+                }
 
                 // Force-reset if stuck in Recording (lost KeyRelease recovery).
                 // Must check BEFORE debounce: when KeyRelease is lost, key_debounce
@@ -6376,51 +6429,34 @@ fn run_openai(
                 // Start recording if idle
                 let mut rec_state = state_clone.lock().unwrap();
                 if *rec_state == RecordingState::Idle {
-                    // Wait for any pending processing to complete before starting new session
+                    // If a previous transcription is still processing, just log it —
+                    // do NOT block here. Blocking the hotkey worker thread freezes
+                    // user interaction (presses queue up, recording starts seconds
+                    // late, etc.). The transcription pipeline tolerates overlap:
+                    // - Each TranscriptionJob carries its own samples copy.
+                    // - sequence_num is a monotonic atomic counter, so new chunks
+                    //   get higher seq than old ones; the output thread sorts by
+                    //   seq via BTreeMap and emits in order.
+                    // We clear the shared audio buffer and reset VAD because the
+                    // mic stream is paused between recordings (no concurrent
+                    // writers), but we leave next_sequence / next_output_seq
+                    // alone — resetting them to 0 would collide with in-flight
+                    // jobs from the previous session.
                     let pending = processing_count_clone.load(Ordering::SeqCst);
                     let job_seq = next_sequence_clone.load(Ordering::SeqCst);
                     let output_seq = next_output_seq_for_callback.load(Ordering::SeqCst);
-
                     if pending > 0 || output_seq < job_seq {
                         println!(
-                            "[{}] Waiting for previous session: {} pending transcriptions, output_seq={} job_seq={}",
+                            "[{}] Previous transcription still in flight ({} pending, output_seq={} job_seq={}) — starting new recording anyway",
                             timestamp(),
                             pending,
                             output_seq,
                             job_seq
                         );
-                        drop(rec_state); // Release lock while waiting
-
-                        // Wait for both: transcriptions to finish AND output to process all results
-                        let wait_start = Instant::now();
-                        loop {
-                            thread::sleep(Duration::from_millis(50));
-                            if wait_start.elapsed() > Duration::from_secs(10) {
-                                eprintln!(
-                                    "[{}] WARNING: Timed out waiting for previous transcription (10s), proceeding anyway",
-                                    timestamp()
-                                );
-                                break;
-                            }
-                            let p = processing_count_clone.load(Ordering::SeqCst);
-                            let j = next_sequence_clone.load(Ordering::SeqCst);
-                            let o = next_output_seq_for_callback.load(Ordering::SeqCst);
-                            if p == 0 && o >= j {
-                                break;
-                            }
-                        }
-                        // Small delay to let typing events channel flush
-                        thread::sleep(Duration::from_millis(100));
-                        rec_state = state_clone.lock().unwrap();
-                        // Re-check state after waiting
-                        if *rec_state != RecordingState::Idle {
-                            return; // State changed while waiting, abort
-                        }
                     }
+
                     samples_clone.lock().unwrap().clear();
                     vad_clone.lock().unwrap().reset();
-                    next_sequence_clone.store(0, Ordering::SeqCst); // Reset sequence for new session
-                    next_output_seq_for_callback.store(0, Ordering::SeqCst); // Reset output sequence too
                     active_preprompt_callback.store(0, Ordering::SeqCst); // Reset preprompt index
                     *recording_start_clone.lock().unwrap() = Some(Instant::now());
                     is_recording_clone.store(true, Ordering::SeqCst);

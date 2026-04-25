@@ -184,3 +184,8 @@ assets = [
 alsa-lib = "*"
 libX11 = "*"
 libXtst = "*"
+
+# Local fork of audiopus_sys 0.1.8 with aarch64-host support (upstream
+# build.rs hard-fails on aarch64 hosts).
+[patch.crates-io]
+audiopus_sys = { path = "third_party/audiopus_sys" }
