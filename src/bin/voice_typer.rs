@@ -1,4 +1,3 @@
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 //! Voice Typer - Record audio, transcribe with Whisper, paste text
 //!
 //! Push-to-talk: Hold hotkey to record, release to transcribe and paste

@@ -1020,7 +1020,18 @@ function showMicDeniedBanner() {
         banner = document.createElement('div');
         banner.id = 'mic-denied-banner';
         banner.style.cssText = 'background:#c0392b;color:#fff;padding:10px 16px;text-align:center;font-size:13px;';
-        banner.innerHTML = 'Voice Keyboard needs microphone access. Open <strong>System Settings → Privacy &amp; Security → Microphone</strong> and enable Voice Keyboard. <button onclick="invoke(\'open_privacy_settings\')" style="margin-left:8px;padding:2px 8px;cursor:pointer;">Open Settings</button>';
+        banner.innerHTML = 'Voice Keyboard needs microphone access. Enable microphone access in your system privacy settings and make sure an input device is available. ';
+        const button = document.createElement('button');
+        button.textContent = 'Open Settings';
+        button.style.cssText = 'margin-left:8px;padding:2px 8px;cursor:pointer;';
+        button.addEventListener('click', async () => {
+            try {
+                await invoke('open_privacy_settings');
+            } catch (e) {
+                console.error('Failed to open settings:', e);
+            }
+        });
+        banner.appendChild(button);
         document.body.insertBefore(banner, document.body.firstChild);
     }
     banner.style.display = '';

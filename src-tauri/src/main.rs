@@ -690,21 +690,26 @@ fn mic_auth_status() -> &'static str {
 async fn request_microphone_permission() -> String {
     #[cfg(target_os = "macos")]
     {
-        use objc2_av_foundation::{AVCaptureDevice, AVMediaTypeAudio};
-        use std::sync::mpsc;
-        let (tx, rx) = mpsc::channel::<bool>();
-        unsafe {
-            let media_type = AVMediaTypeAudio.expect("AVMediaTypeAudio must exist");
-            AVCaptureDevice::requestAccessForMediaType_completionHandler(
-                media_type,
-                &block2::StackBlock::new(move |granted: objc2::runtime::Bool| {
-                    let _ = tx.send(granted.as_bool());
-                }),
-            );
-        }
-        // Block until the user responds to the system dialog
-        let _ = rx.recv();
-        mic_auth_status().to_string()
+        tokio::task::spawn_blocking(|| {
+            use objc2_av_foundation::{AVCaptureDevice, AVMediaTypeAudio};
+            use std::sync::mpsc;
+            let (tx, rx) = mpsc::channel::<bool>();
+            let handler = block2::RcBlock::new(move |granted: objc2::runtime::Bool| {
+                let _ = tx.send(granted.as_bool());
+            });
+            unsafe {
+                let media_type = AVMediaTypeAudio.expect("AVMediaTypeAudio must exist");
+                AVCaptureDevice::requestAccessForMediaType_completionHandler(
+                    media_type,
+                    &handler,
+                );
+            }
+            // Block the spawn_blocking thread (not the async runtime) until the dialog resolves
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(300));
+            mic_auth_status().to_string()
+        })
+        .await
+        .unwrap_or_else(|_| mic_auth_status().to_string())
     }
     #[cfg(not(target_os = "macos"))]
     {
