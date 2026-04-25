@@ -1532,6 +1532,13 @@ fn spawn_voice_typer(config: &AppConfig) -> Result<Child, String> {
     cmd.env("PREPROMPT_2", &config.preprompt_2);
     cmd.env("PREPROMPT_3", &config.preprompt_3);
 
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
     cmd.spawn().map_err(|e| format!("Failed to start {}: {}", path.display(), e))
 }
 
