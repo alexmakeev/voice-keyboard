@@ -400,8 +400,9 @@ fn start_hotkey_listener(
                         .unwrap_or(false);
                     if timed_out {
                         drop(rec_state);
+                        // #5: watchdog timeout (only fires on actual timeout, not every second)
                         eprintln!(
-                            "[watchdog] WARNING: Recording timeout ({}s) — force-stopping stuck recording",
+                            "[HOTKEY] watchdog timeout: recording exceeded {}s, force-stopping stuck recording",
                             max_rec.as_secs()
                         );
                         is_recording_wd.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -4821,6 +4822,33 @@ fn run_openai(
         }
     }
 
+    // #1 / #9: Listener startup + config diagnostic
+    {
+        let hotkey_source = if std::env::args().any(|a| a.starts_with("--key")) {
+            "CLI --key arg"
+        } else if std::env::var("VOICE_KEYBOARD_HOTKEY").is_ok() {
+            "VOICE_KEYBOARD_HOTKEY env"
+        } else {
+            "default_for_platform"
+        };
+        eprintln!(
+            "[HOTKEY] listener starting: trigger_key={:?} ({}) extra_keys={} max_recording_duration={}s platform={}",
+            hotkey.to_rdev_key(),
+            hotkey.name(),
+            extra_keys,
+            max_recording_duration().as_secs(),
+            if cfg!(target_os = "windows") { "windows" }
+            else if cfg!(target_os = "macos") { "macos" }
+            else { "linux" }
+        );
+        eprintln!(
+            "[HOTKEY] config: trigger_key='{}' rdev_key={:?} (from {})",
+            hotkey.name(),
+            hotkey.to_rdev_key(),
+            hotkey_source
+        );
+    }
+
     let config = Arc::new(openai_config);
     let target_key = hotkey.to_rdev_key();
     let target_key2 = hotkey2.map(|k| k.to_rdev_key()); // Right Cmd = structured (only if extra_keys)
@@ -6174,10 +6202,42 @@ fn run_openai(
         // - macOS: via grab_fn (triggered on any keyboard event)
         // - Windows/Linux: via watchdog thread (proactive 1-second polling)
 
+        // #2: Raw key event logging for all KeyPress/KeyRelease (NOT mouse)
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            match &event.event_type {
+                EventType::KeyPress(k) => {
+                    eprintln!(
+                        "[HOTKEY] {} press k={:?} name={:?} state={:?} is_recording={} debounce={}",
+                        now_ms, k, event.name,
+                        *state_clone.lock().unwrap(),
+                        is_recording_clone.load(Ordering::SeqCst),
+                        key_debounce_clone.load(Ordering::SeqCst)
+                    );
+                }
+                EventType::KeyRelease(k) => {
+                    eprintln!(
+                        "[HOTKEY] {} release k={:?} name={:?} state={:?} is_recording={} debounce={}",
+                        now_ms, k, event.name,
+                        *state_clone.lock().unwrap(),
+                        is_recording_clone.load(Ordering::SeqCst),
+                        key_debounce_clone.load(Ordering::SeqCst)
+                    );
+                }
+                _ => {} // mouse and other events — skip to avoid log flood
+            }
+        }
+
         match event.event_type {
             EventType::KeyPress(key)
                 if key == target_key || target_key2 == Some(key) || target_key3 == Some(key) =>
             {
+                // #3: trigger_key matched (press)
+                eprintln!("[HOTKEY] trigger_key matched: action=press key={:?}", key);
+
                 // Force-reset if stuck in Recording (lost KeyRelease recovery).
                 // Must check BEFORE debounce: when KeyRelease is lost, key_debounce
                 // stays true, so swap(true) would return true and hit early-return,
@@ -6185,6 +6245,8 @@ fn run_openai(
                 {
                     let mut rec_state = state_clone.lock().unwrap();
                     if *rec_state == RecordingState::Recording {
+                        // #4: force-reset start
+                        eprintln!("[HOTKEY] force-reset: state was Recording, stopping stream and resetting debounce");
                         eprintln!(
                             "[{}] WARNING: Forced reset — key pressed while already Recording (lost key_release event)",
                             timestamp()
@@ -6211,6 +6273,8 @@ fn run_openai(
                         // Small delay before starting a new recording
                         thread::sleep(Duration::from_millis(200));
                         // Fall through — state is now Idle, debounce is false
+                        // #4: force-reset complete
+                        eprintln!("[HOTKEY] force-reset complete, falling through to start new recording");
                     }
                 }
 
@@ -6221,10 +6285,14 @@ fn run_openai(
                 if key_debounce_clone.swap(true, Ordering::SeqCst) {
                     let rec_state = state_clone.lock().unwrap();
                     if *rec_state == RecordingState::Recording {
+                        // #8: genuine debounce block
+                        eprintln!("[HOTKEY] debounce-blocked: state=Recording (genuine repeat) -> ignoring press");
                         return; // Genuine key-repeat while recording — ignore
                     }
                     // state is Idle — debounce is stale, proceed with new recording
                     // key_debounce is already true (set by swap above), which is correct
+                    // #8: stale debounce
+                    eprintln!("[HOTKEY] debounce stale: state=Idle, debounce=true -> proceeding with new recording");
                 }
 
                 // Check for pending retry job first
@@ -6368,6 +6436,8 @@ fn run_openai(
                         *dev_report_callback.lock().unwrap() = Some(new_report);
                     }
 
+                    // #6: recording started
+                    eprintln!("[HOTKEY] recording STARTED");
                     println!("[{}] Recording...", timestamp());
                     std::io::stdout().flush().ok();
                     // No start beep - it would be captured in the recording
@@ -6391,6 +6461,8 @@ fn run_openai(
             EventType::KeyRelease(key)
                 if key == target_key || target_key2 == Some(key) || target_key3 == Some(key) =>
             {
+                // #3: trigger_key matched (release)
+                eprintln!("[HOTKEY] trigger_key matched: action=release key={:?}", key);
                 key_debounce_clone.store(false, Ordering::SeqCst);
 
                 // Check if currently recording
@@ -6398,6 +6470,8 @@ fn run_openai(
                 if *rec_state == RecordingState::Recording {
                     is_recording_clone.store(false, Ordering::SeqCst);
                     *rec_state = RecordingState::Idle;
+                    // #7: recording stopped via KeyRelease
+                    eprintln!("[HOTKEY] recording STOPPED via KeyRelease");
 
                     // Pause persistent stream to hide macOS microphone indicator (instant)
                     {
