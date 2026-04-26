@@ -31,7 +31,7 @@ let debugFilters = {
 };
 let config = {
     model: 'large-v3-turbo',
-    language: 'ru',
+    language: 'auto',
     hotkey: 'fn',
     input_method: 'keyboard',
     openai_api_key: '',
@@ -58,16 +58,22 @@ const MODELS = [
 
 const LANGUAGES = [
     { code: 'auto', name: 'Auto-detect' },
-    { code: 'en', name: 'English' },
-    { code: 'ru', name: 'Russian' },
-    { code: 'de', name: 'German' },
-    { code: 'fr', name: 'French' },
-    { code: 'es', name: 'Spanish' },
-    { code: 'it', name: 'Italian' },
-    { code: 'pt', name: 'Portuguese' },
+    { code: 'ar', name: 'Arabic' },
     { code: 'zh', name: 'Chinese' },
+    { code: 'cs', name: 'Czech' },
+    { code: 'nl', name: 'Dutch' },
+    { code: 'en', name: 'English' },
+    { code: 'fr', name: 'French' },
+    { code: 'de', name: 'German' },
+    { code: 'it', name: 'Italian' },
     { code: 'ja', name: 'Japanese' },
-    { code: 'ko', name: 'Korean' }
+    { code: 'ko', name: 'Korean' },
+    { code: 'pl', name: 'Polish' },
+    { code: 'pt', name: 'Portuguese' },
+    { code: 'ru', name: 'Russian' },
+    { code: 'es', name: 'Spanish' },
+    { code: 'tr', name: 'Turkish' },
+    { code: 'uk', name: 'Ukrainian' },
 ];
 
 // DOM Elements
@@ -90,6 +96,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     renderModels();
     renderLanguages();
     startStatusPolling();
+    checkApiKeyRequired();
 });
 
 function cacheElements() {
@@ -170,6 +177,26 @@ function setupTabs() {
 }
 
 function setupEventListeners() {
+    // Record button: push-to-talk via mouse (for testing without working hotkey)
+    const recBtn = elements.hotkeyState;
+    if (recBtn) {
+        const stopRecording = async () => {
+            try { await invoke('test_recording_stop'); } catch (e) { console.error('test_recording_stop failed:', e); }
+        };
+        recBtn.addEventListener('mousedown', async (e) => {
+            e.preventDefault();
+            try { await invoke('test_recording_start'); } catch (e) { console.error('test_recording_start failed:', e); }
+        });
+        recBtn.addEventListener('mouseup', stopRecording);
+        recBtn.addEventListener('mouseleave', stopRecording);
+        // Touch support (optional, desktop-primary)
+        recBtn.addEventListener('touchstart', async (e) => {
+            e.preventDefault();
+            try { await invoke('test_recording_start'); } catch (e) { console.error('test_recording_start failed:', e); }
+        }, { passive: false });
+        recBtn.addEventListener('touchend', stopRecording);
+    }
+
     // Clear debug log
     elements.clearDebugBtn.addEventListener('click', async () => {
         debugLines = [];
@@ -225,6 +252,7 @@ function setupEventListeners() {
     elements.openaiKeyInput.addEventListener('input', (e) => {
         config.openai_api_key = e.target.value;
         updateApiKeyHint();
+        checkApiKeyRequired();
     });
 
     elements.openaiUrlInput.addEventListener('input', (e) => {
@@ -321,7 +349,7 @@ async function setupTauriListeners() {
         const payload = event.payload;
         lastPollStatus = payload.status + ':' + payload.text;
         updateStatus(payload.status, payload.text);
-        updateConnectionBadge(payload.status);
+        updateConnectionBadge(payload.status, payload.text);
     });
 
     // Listen for new transcriptions
@@ -737,7 +765,7 @@ function updateStatus(status, text) {
     }
 }
 
-function updateConnectionBadge(status) {
+function updateConnectionBadge(status, text) {
     const el = elements.testConnection;
     if (!el) return;
 
@@ -750,22 +778,31 @@ function updateConnectionBadge(status) {
         case 'typing':
             el.className = 'info-value connected';
             el.textContent = 'Connected';
+            el.title = '';
             break;
         case 'connecting':
             el.className = 'info-value';
             el.textContent = 'Starting...';
+            el.title = '';
             break;
-        case 'disconnected':
+        case 'disconnected': {
             el.className = 'info-value disconnected';
-            el.textContent = 'Disconnected';
+            const reason = text && text !== 'Disconnected' ? text : '';
+            el.textContent = reason ? 'Not connected: ' + reason : 'Not connected';
+            el.title = reason || '';
             break;
-        case 'error':
+        }
+        case 'error': {
             el.className = 'info-value error';
-            el.textContent = 'Error';
+            const reason = text && text !== 'Error' ? text : '';
+            el.textContent = reason ? 'Error: ' + reason : 'Error';
+            el.title = reason || '';
             break;
+        }
         default:
             el.className = 'info-value';
             el.textContent = status;
+            el.title = '';
     }
 }
 
@@ -822,6 +859,39 @@ function updateApiKeyHint() {
     }
 }
 
+function checkApiKeyRequired() {
+    const isOpenai = config.transcription_mode === 'openai';
+    const keyEmpty = !(config.openai_api_key && config.openai_api_key.trim());
+    const keyInput = elements.openaiKeyInput;
+
+    if (isOpenai && keyEmpty) {
+        // Switch to Settings tab
+        const settingsTab = document.querySelector('.tab[data-tab="settings"]');
+        if (settingsTab) settingsTab.click();
+
+        // Highlight the API key field
+        if (keyInput) {
+            keyInput.classList.add('input-error');
+            keyInput.focus();
+        }
+
+        // Show required hint (reuse api-key-hint element or add one)
+        let reqHint = document.getElementById('api-key-required-hint');
+        if (!reqHint && keyInput) {
+            reqHint = document.createElement('span');
+            reqHint.id = 'api-key-required-hint';
+            reqHint.className = 'api-key-required-hint';
+            reqHint.textContent = 'API key is required';
+            keyInput.parentNode.insertBefore(reqHint, keyInput.nextSibling);
+        }
+    } else {
+        // Remove highlight if key is now set
+        if (keyInput) keyInput.classList.remove('input-error');
+        const reqHint = document.getElementById('api-key-required-hint');
+        if (reqHint) reqHint.remove();
+    }
+}
+
 function updateTestMode() {
     if (elements.testMode) {
         elements.testMode.textContent = config.transcription_mode === 'openai' ? 'OpenAI API' : 'Local Whisper';
@@ -861,7 +931,7 @@ function startStatusPolling() {
                     } else {
                         lastPollStatus = key;
                         updateStatus(data.status, data.text);
-                        updateConnectionBadge(data.status);
+                        updateConnectionBadge(data.status, data.text);
                     }
                 }
             }
@@ -914,9 +984,25 @@ function stopStatusPolling() {
 async function checkPermissions() {
     try {
         const perms = await invoke('check_permissions');
+
+        // If the OS hasn't asked the user yet, trigger the system dialog now
+        // so they see it at startup rather than on first hotkey press
+        if (perms.microphone_status === 'not_determined') {
+            await invoke('request_microphone_permission');
+            // Re-fetch after the dialog resolves
+            return checkPermissions();
+        }
+
         updatePermissionItem('perm-microphone', perms.microphone);
         updatePermissionItem('perm-accessibility', perms.accessibility);
         updatePermissionItem('perm-input_monitoring', perms.input_monitoring);
+
+        const micBlocked = perms.microphone_status === 'denied' || perms.microphone_status === 'restricted';
+        if (micBlocked) {
+            showMicDeniedBanner();
+        } else {
+            hideMicDeniedBanner();
+        }
 
         if (perms.microphone && perms.accessibility && perms.input_monitoring) {
             elements.permissionsModal.classList.add('hidden');
@@ -926,6 +1012,34 @@ async function checkPermissions() {
     } catch (e) {
         console.error('Failed to check permissions:', e);
     }
+}
+
+function showMicDeniedBanner() {
+    let banner = document.getElementById('mic-denied-banner');
+    if (!banner) {
+        banner = document.createElement('div');
+        banner.id = 'mic-denied-banner';
+        banner.style.cssText = 'background:#c0392b;color:#fff;padding:10px 16px;text-align:center;font-size:13px;';
+        banner.innerHTML = 'Voice Keyboard needs microphone access. Enable microphone access in your system privacy settings and make sure an input device is available. ';
+        const button = document.createElement('button');
+        button.textContent = 'Open Settings';
+        button.style.cssText = 'margin-left:8px;padding:2px 8px;cursor:pointer;';
+        button.addEventListener('click', async () => {
+            try {
+                await invoke('open_privacy_settings');
+            } catch (e) {
+                console.error('Failed to open settings:', e);
+            }
+        });
+        banner.appendChild(button);
+        document.body.insertBefore(banner, document.body.firstChild);
+    }
+    banner.style.display = '';
+}
+
+function hideMicDeniedBanner() {
+    const banner = document.getElementById('mic-denied-banner');
+    if (banner) banner.style.display = 'none';
 }
 
 function updatePermissionItem(elementId, granted) {
@@ -1157,8 +1271,9 @@ async function checkForUpdate() {
         }
     } catch (e) {
         console.error('Failed to check for update:', e);
-        setUpdateStatus('check-failed', 'Check failed');
-        setTimeout(() => setUpdateStatus('', ''), 3000);
+        const reason = (typeof e === 'string' ? e : (e && e.message ? e.message : String(e))) || 'Unknown error';
+        setUpdateStatus('check-failed', 'Check failed: ' + reason);
+        setTimeout(() => setUpdateStatus('', ''), 6000);
     } finally {
         btn.disabled = false;
         btn.textContent = 'Check for updates';

@@ -17,11 +17,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04
-            features: "whisper"
+            features: "whisper,opus"
           - os: macos-14
-            features: "whisper,metal"
+            features: "whisper,metal,opus"
           - os: macos-15-intel
-            features: "whisper"
+            features: "whisper,opus"
           - os: windows-latest
             features: "whisper,opus"
 
@@ -46,7 +46,12 @@ jobs:
             libx11-dev \
             libxtst-dev \
             libevdev-dev \
+            libopus-dev \
             pkg-config
+
+      - name: Install macOS dependencies
+        if: startsWith(matrix.os, 'macos')
+        run: brew install opus pkg-config
 
       - name: Check
         run: cargo check --bin voice-typer --features "${{ matrix.features }}"
@@ -80,13 +85,13 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            features: "whisper"
+            features: "whisper,opus"
           - os: macos-14
             target: aarch64-apple-darwin
-            features: "whisper,metal"
+            features: "whisper,metal,opus"
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            features: "whisper"
+            features: "whisper,opus"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             features: "whisper,opus"
@@ -116,7 +121,12 @@ jobs:
             libx11-dev \
             libxtst-dev \
             libevdev-dev \
+            libopus-dev \
             pkg-config
+
+      - name: Install macOS dependencies
+        if: startsWith(matrix.os, 'macos')
+        run: brew install opus pkg-config
 
       - name: Build
         env:
@@ -125,8 +135,15 @@ jobs:
         run: cargo build --release --bin voice-typer --features "${{ matrix.features }}" --target ${{ matrix.target }}
 
       - name: Run unit tests
-        run: cargo test --features "${{ matrix.features }}" --target ${{ matrix.target }}
-        continue-on-error: true
+        shell: bash
+        run: |
+          # On Windows, strip the `whisper` feature — whisper-rs-sys has an MSVC CRT
+          # conflict that prevents linking in test mode. All non-whisper tests still run.
+          TEST_FEATURES="${{ matrix.features }}"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            TEST_FEATURES=$(echo "$TEST_FEATURES" | sed 's/whisper,//;s/,whisper//;s/^whisper$//')
+          fi
+          cargo test --features "$TEST_FEATURES" --target ${{ matrix.target }}
 
       - name: Test binary runs
         shell: bash
@@ -146,13 +163,13 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            features: "whisper"
+            features: "whisper,opus"
           - os: macos-14
             target: aarch64-apple-darwin
-            features: "whisper,metal"
+            features: "whisper,metal,opus"
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            features: "whisper"
+            features: "whisper,opus"
 
     runs-on: ${{ matrix.os }}
 
@@ -183,7 +200,12 @@ jobs:
             libx11-dev \
             libxtst-dev \
             libevdev-dev \
+            libopus-dev \
             pkg-config
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install opus pkg-config
 
       - name: Cache Whisper model
         uses: actions/cache@v4
@@ -227,10 +249,10 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
-            features: "whisper,metal"
+            features: "whisper,metal,opus"
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            features: "whisper"
+            features: "whisper,opus"
 
     runs-on: ${{ matrix.os }}
 
@@ -246,6 +268,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}-tauri
+
+      - name: Install macOS dependencies
+        run: brew install opus pkg-config
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked

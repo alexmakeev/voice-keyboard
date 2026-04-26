@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build only, skip publishing a GitHub Release"
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -65,61 +71,6 @@ jobs:
           name: voice-typer-x86_64-pc-windows-msvc
           path: voice-typer-x86_64-pc-windows-msvc.zip
 
-  # Windows ARM64 CLI build with launcher + core app
-  build-windows-arm:
-    runs-on: windows-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-pc-windows-msvc
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: windows-arm-release
-
-      # Build core app (voice-typer) with all features
-      - name: Build voice-typer
-        run: cargo build --release --bin voice-typer --features "whisper,opus,gui,updater" --target aarch64-pc-windows-msvc
-
-      # Build launcher
-      - name: Build launcher
-        run: cargo build --release --bin voice-typer-launcher --features "updater" --target aarch64-pc-windows-msvc
-
-      # Skip testing — cannot run ARM64 binaries on x64 runner
-      - name: Test binaries
-        shell: bash
-        run: |
-          echo "Skipping tests - cannot run ARM64 binaries on x64 runner"
-
-      # Prepare artifacts
-      - name: Prepare artifacts
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist
-
-          # Copy both executables
-          Copy-Item "target/aarch64-pc-windows-msvc/release/voice-typer.exe" -Destination "dist/"
-          Copy-Item "target/aarch64-pc-windows-msvc/release/voice-typer-launcher.exe" -Destination "dist/"
-
-          # Copy docs
-          Copy-Item "README.md" -Destination "dist/" -ErrorAction SilentlyContinue
-          Copy-Item "LICENSE" -Destination "dist/"
-
-          # Create zip
-          Compress-Archive -Path "dist/*" -DestinationPath "voice-typer-aarch64-pc-windows-msvc.zip"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v5
-        with:
-          name: voice-typer-aarch64-pc-windows-msvc
-          path: voice-typer-aarch64-pc-windows-msvc.zip
-
   # Windows Tauri GUI app (NSIS installer)
   build-tauri-windows:
     runs-on: windows-latest
@@ -159,45 +110,6 @@ jobs:
           name: voice-keyboard-windows-x64-setup
           path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
 
-  # Windows ARM64 Tauri GUI app (NSIS installer)
-  build-tauri-windows-arm:
-    runs-on: windows-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-pc-windows-msvc
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: windows-arm-tauri
-
-      - name: Build voice-typer sidecar
-        run: cargo build --release --bin voice-typer --features "whisper,opus" --target aarch64-pc-windows-msvc
-
-      - name: Copy sidecar binary
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path src-tauri/binaries
-          Copy-Item "target/aarch64-pc-windows-msvc/release/voice-typer.exe" -Destination "src-tauri/binaries/voice-typer-aarch64-pc-windows-msvc.exe"
-
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2" --locked
-
-      - name: Build Tauri app
-        run: cargo tauri build --target aarch64-pc-windows-msvc
-
-      - name: Upload NSIS installer
-        uses: actions/upload-artifact@v5
-        with:
-          name: voice-keyboard-windows-arm64-setup
-          path: src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*.exe
-
   # macOS Tauri GUI app (DMG)
   build-tauri-macos:
     runs-on: macos-latest
@@ -214,8 +126,8 @@ jobs:
         with:
           key: macos-tauri
 
-      - name: Install autotools
-        run: brew install autoconf automake libtool
+      - name: Install macOS dependencies
+        run: brew install autoconf automake libtool opus pkg-config
 
       - name: Build voice-typer sidecar
         env:
@@ -249,11 +161,11 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             arch: arm64
-            features: "whisper,metal"
+            features: "whisper,metal,opus"
           - os: macos-15-intel
             target: x86_64-apple-darwin
             arch: x64
-            features: "whisper"
+            features: "whisper,opus"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -267,6 +179,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}-release
+
+      - name: Install macOS dependencies
+        run: brew install opus pkg-config
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
@@ -285,16 +200,31 @@ jobs:
           mkdir -p src-tauri/binaries
           cp target/${{ matrix.target }}/release/voice-typer src-tauri/binaries/voice-typer-${{ matrix.target }}
 
-      - name: Build Tauri DMG
-        run: cargo tauri build --target ${{ matrix.target }} --bundles dmg
+      - name: Build Tauri app bundle
+        run: cargo tauri build --target ${{ matrix.target }} --bundles app
         env:
           APPLE_SIGNING_IDENTITY: "-"
           CI: true
 
-      - name: Rename DMG
+      - name: Re-sign app bundle with entitlements
         run: |
+          APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Voice Keyboard.app"
+          SIDECAR="${APP}/Contents/MacOS/voice-typer"
+          ENTITLEMENTS="src-tauri/entitlements.plist"
+          # Re-sign sidecar first so the bundle signature covers it
+          codesign --force --sign - --entitlements "${ENTITLEMENTS}" --options runtime "${SIDECAR}"
+          # Re-sign the bundle (deep covers all nested binaries)
+          codesign --force --deep --sign - --entitlements "${ENTITLEMENTS}" --options runtime "${APP}"
+          # Verify
+          codesign --verify --deep --strict "${APP}"
+          codesign -d --entitlements - "${APP}"
+
+      - name: Package DMG from signed app
+        run: |
+          APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Voice Keyboard.app"
           mkdir -p dist
-          mv target/${{ matrix.target }}/release/bundle/dmg/*.dmg dist/voice-keyboard-macos-${{ matrix.arch }}.dmg
+          hdiutil create -volname "Voice Keyboard" -srcfolder "${APP}" -ov -format UDZO \
+            "dist/voice-keyboard-macos-${{ matrix.arch }}.dmg"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -304,7 +234,8 @@ jobs:
 
   # Create GitHub Release
   release:
-    needs: [build-windows, build-windows-arm, build-tauri-windows, build-tauri-windows-arm, build-tauri-macos, build-macos]
+    if: github.event_name == 'push' || inputs.dry_run == false
+    needs: [build-windows, build-tauri-windows, build-tauri-macos, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -7,15 +7,19 @@
 //! Usage:
 //!   cargo run --bin minimal
 
+#[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use rdev::{listen, Event, EventType, Key};
 
+#[cfg(target_os = "macos")]
 use arboard::Clipboard;
 
 /// Double-tap detection timeout
+#[cfg(target_os = "macos")]
 const DOUBLE_TAP_TIMEOUT_MS: u64 = 500;
 
 /// Text to insert
@@ -103,6 +107,7 @@ fn run_macos() {
 }
 
 /// Insert text via clipboard + Cmd+V, preserving previous clipboard content
+#[cfg(target_os = "macos")]
 fn insert_text(text: &str) -> Result<(), String> {
     let mut clipboard = Clipboard::new().map_err(|e| format!("Clipboard error: {}", e))?;
 
@@ -153,6 +158,7 @@ fn insert_text(text: &str) -> Result<(), String> {
 }
 
 /// Simple timestamp for logging (no chrono dependency)
+#[cfg(target_os = "macos")]
 fn chrono_lite() -> String {
     use std::time::SystemTime;
     let now = SystemTime::now()

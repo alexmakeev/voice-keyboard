@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required: microphone access for voice recording -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <!-- Required: sidecar (voice-typer) inherits parent's TCC identity so macOS
+         grants it the same microphone permission without a separate TCC prompt -->
+    <key>com.apple.security.inherit</key>
+    <true/>
+
+    <!-- Required: whisper.cpp and some Rust runtime code requires JIT/unsigned
+         executable memory (e.g. GGML backends) -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- Required: voice-typer sidecar is signed separately by rustc; without this
+         the parent app cannot load it under library validation -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>

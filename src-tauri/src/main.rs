@@ -75,6 +75,8 @@ struct AppState {
     config: Arc<Mutex<AppConfig>>,
     /// Background voice-typer process
     voice_typer: Arc<Mutex<Option<Child>>>,
+    /// Stdin pipe to voice-typer (for TEST_PRESS / TEST_RELEASE commands)
+    voice_typer_stdin: Arc<Mutex<Option<std::process::ChildStdin>>>,
     /// Last known status (for polling from frontend)
     last_status: Arc<Mutex<serde_json::Value>>,
     /// Cached update info from last check
@@ -140,7 +142,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             model: "large-v3-turbo".to_string(),
-            language: "ru".to_string(),
+            language: "auto".to_string(),
             hotkey: "fn".to_string(),
             input_method: "keyboard".to_string(),
             openai_api_key: String::new(),
@@ -632,7 +634,7 @@ async fn open_github_issue(zip_path: String) -> Result<(), String> {
 /// Check macOS permissions: microphone, accessibility, input monitoring
 #[tauri::command]
 fn check_permissions() -> serde_json::Value {
-    let microphone = check_microphone_permission();
+    let microphone_status = mic_auth_status();
     let accessibility;
     let input_monitoring;
 
@@ -648,25 +650,93 @@ fn check_permissions() -> serde_json::Value {
     }
 
     serde_json::json!({
-        "microphone": microphone,
+        "microphone": microphone_status == "authorized",
+        "microphone_status": microphone_status,
         "accessibility": accessibility,
         "input_monitoring": input_monitoring,
     })
 }
 
-/// Check microphone permission.
-/// On macOS: always returns true — permission is enforced by macOS at stream creation time.
-/// If permission is denied, voice-typer will log an error when trying to record.
-fn check_microphone_permission() -> bool {
+/// Query current microphone authorization status via AVFoundation.
+/// Returns: "authorized" | "denied" | "restricted" | "not_determined"
+fn mic_auth_status() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        true
+        use objc2_av_foundation::{AVAuthorizationStatus, AVCaptureDevice, AVMediaTypeAudio};
+        unsafe {
+            let media_type = AVMediaTypeAudio.expect("AVMediaTypeAudio must exist");
+            match AVCaptureDevice::authorizationStatusForMediaType(media_type) {
+                AVAuthorizationStatus::Authorized => "authorized",
+                AVAuthorizationStatus::Denied => "denied",
+                AVAuthorizationStatus::Restricted => "restricted",
+                _ => "not_determined",
+            }
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
         use cpal::traits::HostTrait;
-        cpal::default_host().default_input_device().is_some()
+        if cpal::default_host().default_input_device().is_some() {
+            "authorized"
+        } else {
+            "denied"
+        }
     }
+}
+
+/// Trigger the OS microphone permission dialog (no-op if already determined).
+/// Returns the status after the prompt resolves.
+#[tauri::command]
+async fn request_microphone_permission() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        tokio::task::spawn_blocking(|| {
+            use objc2_av_foundation::{AVCaptureDevice, AVMediaTypeAudio};
+            use std::sync::mpsc;
+            let (tx, rx) = mpsc::channel::<bool>();
+            let handler = block2::RcBlock::new(move |granted: objc2::runtime::Bool| {
+                let _ = tx.send(granted.as_bool());
+            });
+            unsafe {
+                let media_type = AVMediaTypeAudio.expect("AVMediaTypeAudio must exist");
+                AVCaptureDevice::requestAccessForMediaType_completionHandler(
+                    media_type,
+                    &handler,
+                );
+            }
+            // Block the spawn_blocking thread (not the async runtime) until the dialog resolves
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(300));
+            mic_auth_status().to_string()
+        })
+        .await
+        .unwrap_or_else(|_| mic_auth_status().to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        mic_auth_status().to_string()
+    }
+}
+
+/// Send TEST_PRESS command to voice-typer stdin (simulates hotkey press via mouse button)
+#[tauri::command]
+fn test_recording_start(state: State<AppState>) -> Result<(), String> {
+    let mut guard = state.voice_typer_stdin.lock().unwrap();
+    if let Some(ref mut stdin) = *guard {
+        writeln!(stdin, "TEST_PRESS").map_err(|e| e.to_string())?;
+        stdin.flush().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Send TEST_RELEASE command to voice-typer stdin (simulates hotkey release via mouse button)
+#[tauri::command]
+fn test_recording_stop(state: State<AppState>) -> Result<(), String> {
+    let mut guard = state.voice_typer_stdin.lock().unwrap();
+    if let Some(ref mut stdin) = *guard {
+        writeln!(stdin, "TEST_RELEASE").map_err(|e| e.to_string())?;
+        stdin.flush().map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Restart voice-typer process (stop + start)
@@ -682,12 +752,12 @@ fn restart_voice_typer(state: State<AppState>, app: AppHandle) -> Result<(), Str
     Ok(())
 }
 
-/// Open system privacy/security settings
+/// Open system privacy/security settings (microphone pane on macOS)
 #[tauri::command]
 fn open_privacy_settings() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        open::that("x-apple.systempreferences:com.apple.preference.security?Privacy")
+        open::that("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
             .map_err(|e| e.to_string())
     }
     #[cfg(target_os = "windows")]
@@ -1232,9 +1302,15 @@ async fn install_update_windows(
     ).await?;
 
     // Launch the NSIS installer with /S (silent install)
-    Command::new(&installer_path)
-        .arg("/S")
-        .spawn()
+    let mut installer_cmd = Command::new(&installer_path);
+    installer_cmd.arg("/S");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        installer_cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    installer_cmd.spawn()
         .map_err(|e| {
             let _ = fs::remove_file(&installer_path);
             format!("Failed to launch installer: {}", e)
@@ -1353,9 +1429,15 @@ async fn perform_auto_update_windows(
     tracing::info!("[update] perform_auto_update: launching installer {}", installer_path.display());
 
     // Launch NSIS installer with /S (silent install)
-    Command::new(&installer_path)
-        .arg("/S")
-        .spawn()
+    let mut installer_cmd = Command::new(&installer_path);
+    installer_cmd.arg("/S");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        installer_cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    installer_cmd.spawn()
         .map_err(|e| {
             let _ = fs::remove_file(&installer_path);
             format!("Failed to launch installer: {}", e)
@@ -1431,7 +1513,7 @@ fn spawn_voice_typer(config: &AppConfig) -> Result<Child, String> {
     let path = find_voice_typer_path()?;
 
     let mut cmd = Command::new(&path);
-    cmd.stdin(Stdio::null())
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -1490,6 +1572,13 @@ fn spawn_voice_typer(config: &AppConfig) -> Result<Child, String> {
     cmd.env("PREPROMPT_1", &config.preprompt_1);
     cmd.env("PREPROMPT_2", &config.preprompt_2);
     cmd.env("PREPROMPT_3", &config.preprompt_3);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 
     cmd.spawn().map_err(|e| format!("Failed to start {}: {}", path.display(), e))
 }
@@ -1601,8 +1690,12 @@ fn extract_status(line: &str) -> Option<(&'static str, String)> {
     }
     if lower.contains("cannot connect") || (lower.contains("not found") && lower.contains("model"))
         || (lower.contains("error") && lower.contains("exit"))
+        || (lower.contains("[error]") && lower.contains("no openai api key"))
+        || (lower.contains("[error]") && lower.contains("no openrouter api key"))
     {
-        return Some(("error", "Error".into()));
+        // Preserve original line as reason so frontend can display it
+        let reason = line.trim().to_string();
+        return Some(("error", reason));
     }
     None
 }
@@ -1663,10 +1756,15 @@ fn start_voice_typer(state: &AppState, app: &AppHandle) {
 
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
+            // Take stdin before storing child (child moves into guard below)
+            let child_stdin = child.stdin.take();
 
             *guard = Some(child);
             // Drop the lock before spawning threads
             drop(guard);
+
+            // Store stdin for test_recording_start/stop commands
+            *state.voice_typer_stdin.lock().unwrap() = child_stdin;
 
             // Spawn stdout reader thread
             if let Some(stdout) = stdout {
@@ -1778,6 +1876,8 @@ fn start_voice_typer(state: &AppState, app: &AppHandle) {
 
 /// Kill the background voice-typer process and wait for it to exit
 fn stop_voice_typer(state: &AppState) {
+    // Drop stdin first so voice-typer sees EOF on its stdin reader
+    *state.voice_typer_stdin.lock().unwrap() = None;
     let mut guard = state.voice_typer.lock().unwrap();
     if let Some(mut child) = guard.take() {
         let _ = child.kill();
@@ -1790,6 +1890,16 @@ fn stop_voice_typer(state: &AppState) {
 // ============================================================================
 
 fn main() {
+    // Defensive: detach from any inherited/allocated console on Windows.
+    // FreeConsole returns 0 if no console was attached (safe to ignore).
+    #[cfg(target_os = "windows")]
+    {
+        extern "system" {
+            fn FreeConsole() -> i32;
+        }
+        unsafe { FreeConsole(); }
+    }
+
     // Load config
     let config = load_config();
 
@@ -1801,6 +1911,7 @@ fn main() {
         transcriptions: Arc::new(Mutex::new(Vec::new())),
         config: Arc::new(Mutex::new(config)),
         voice_typer: Arc::new(Mutex::new(None)),
+        voice_typer_stdin: Arc::new(Mutex::new(None)),
         last_status: Arc::new(Mutex::new(serde_json::json!({"status": "connecting", "text": "Starting..."}))),
         update_info: Arc::new(Mutex::new(None)),
     };
@@ -1917,6 +2028,7 @@ fn main() {
             create_debug_report,
             open_github_issue,
             check_permissions,
+            request_microphone_permission,
             open_privacy_settings,
             restart_voice_typer,
             get_audio_devices,
@@ -1924,6 +2036,8 @@ fn main() {
             check_for_update,
             install_update,
             perform_auto_update,
+            test_recording_start,
+            test_recording_stop,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

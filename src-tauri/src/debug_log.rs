@@ -11,6 +11,7 @@ pub struct DebugLog {
     session_start: Option<chrono::DateTime<Local>>,
 }
 
+#[allow(dead_code)]
 impl DebugLog {
     pub fn new() -> Self {
         Self {

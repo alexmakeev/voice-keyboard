@@ -28,6 +28,9 @@ body {
     color: var(--text-primary);
     line-height: 1.5;
     min-height: 100vh;
+    user-select: none;
+    -webkit-user-select: none;
+    -moz-user-select: none;
 }
 
 .app {
@@ -57,18 +60,24 @@ body {
 
 .tabs {
     display: flex;
-    gap: 8px;
+    width: 100%;
+    gap: 0;
 }
 
 .tab {
+    flex: 1 1 0;
+    text-align: center;
     background: transparent;
     border: none;
     color: var(--text-secondary);
-    padding: 8px 16px;
+    padding: 8px 4px;
     cursor: pointer;
     border-radius: 6px;
     font-size: 14px;
     transition: all 0.2s;
+    user-select: none;
+    -webkit-user-select: none;
+    -moz-user-select: none;
 }
 
 .tab:hover {
@@ -770,6 +779,17 @@ body {
     border-color: var(--accent);
 }
 
+.input-error {
+    border-color: #e74c3c !important;
+    box-shadow: 0 0 0 2px rgba(231, 76, 60, 0.2);
+}
+
+.api-key-required-hint {
+    color: #e74c3c;
+    font-size: 12px;
+    margin-top: 4px;
+}
+
 .field {
     display: flex;
     flex-direction: column;
@@ -1252,4 +1272,102 @@ body {
     color: var(--text-secondary);
     margin-top: 8px;
     display: block;
+}
+
+/* ============================================================
+   User-select: restore text selection for copyable areas
+   ============================================================ */
+
+input,
+textarea,
+.input,
+.select,
+.debug-log,
+.debug-line,
+.test-result-text,
+.log-entry .text,
+.log-entry .timestamp,
+.api-key-hint {
+    user-select: text;
+    -webkit-user-select: text;
+    -moz-user-select: text;
+}
+
+/* Explicit none for chrome elements (in case body default doesn't cascade) */
+h1, h2, h3, h4, h5, h6,
+.field-label,
+.section-title,
+.info-label,
+.info-value,
+.mode-card-title,
+.mode-card-desc,
+.model-name,
+.model-desc,
+.model-size,
+.status-text,
+.hotkey-hint,
+.version-label,
+.update-message,
+.update-hint,
+.perm-name,
+.perm-desc,
+.toggle-label,
+.field-note,
+.app-name,
+.app-version,
+.app-update-status {
+    user-select: none;
+    -webkit-user-select: none;
+    -moz-user-select: none;
+}
+
+/* ============================================================
+   Record Button (Fix 3: big push-to-talk button via mouse)
+   ============================================================ */
+
+.record-test-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    width: min(200px, 60%);
+    height: 200px;
+    margin: 0 auto;
+    border: none;
+    border-radius: 16px;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, transform 0.1s;
+    user-select: none;
+    -webkit-user-select: none;
+    -moz-user-select: none;
+    outline: none;
+    touch-action: none;
+}
+
+.record-test-btn .record-btn-icon {
+    font-size: 48px;
+    line-height: 1;
+    pointer-events: none;
+}
+
+.record-test-btn .record-btn-label {
+    font-size: 16px;
+    font-weight: 500;
+    pointer-events: none;
+}
+
+.record-test-btn:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+}
+
+.record-test-btn:active,
+.record-test-btn.recording {
+    background: rgba(233, 69, 96, 0.25);
+    color: var(--accent);
+    transform: scale(0.97);
+    animation: pulse-bg 1.5s infinite;
 }

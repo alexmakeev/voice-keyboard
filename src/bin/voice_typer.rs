@@ -232,20 +232,20 @@ enum RecordingState {
 
 /// Wrapper to move non-Send closures to a worker thread.
 ///
-/// The grab_fn callback passed to `rdev::grab` on macOS captures `cpal::Stream`
-/// (via `Arc<Mutex<Option<Stream>>>`), which is `!Send` due to internal raw pointers.
-/// However, the stream is always accessed through the Mutex, providing safe synchronization.
-/// The worker thread processes events sequentially, so there is no concurrent access.
+/// The hotkey callback captures `cpal::Stream` (via `Arc<Mutex<Option<Stream>>>`),
+/// which is `!Send` due to internal raw pointers. However, the stream is always
+/// accessed through the Mutex, providing safe synchronization. The worker thread
+/// processes events sequentially, so there is no concurrent access.
 ///
 /// SAFETY: The wrapped value is only ever accessed from a single worker thread.
 /// All shared state inside the closure is behind Arc<Mutex<..>> or Arc<AtomicBool>.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 struct SendCallback<F>(F);
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 unsafe impl<F> Send for SendCallback<F> {}
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl<F: FnOnce()> SendCallback<F> {
     fn run(self) {
         (self.0)();
@@ -371,21 +371,97 @@ fn start_hotkey_listener(
     }
     #[cfg(not(target_os = "macos"))]
     {
-        if let Err(e) = listen(callback) {
-            eprintln!("Error: {:?}", e);
+        // Windows/Linux watchdog: on non-macOS there is no grab_fn timeout recovery.
+        // This background thread checks every second whether a recording has been running
+        // for longer than max_recording_duration(). If so, it force-resets state to Idle,
+        // pauses the audio stream, and restores system volume — equivalent to what the
+        // macOS grab_fn timeout does on each key event, but as a proactive periodic check.
+        //
+        // Note: key_debounce (inside the callback closure) cannot be reset here. However,
+        // the KeyPress handler now detects stale debounce (state=Idle but debounce=true)
+        // and allows the next press to proceed, so recovery works correctly after this reset.
+        let max_rec = max_recording_duration();
+        let state_wd = Arc::clone(&state);
+        let recording_start_wd = Arc::clone(&recording_start);
+        let is_recording_wd = Arc::clone(&is_recording);
+        let persistent_stream_wd = Arc::clone(&persistent_stream);
+        let volume_controller_wd = Arc::clone(&volume_controller);
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                let rec_state = state_wd.lock().unwrap();
+                if *rec_state == RecordingState::Recording {
+                    let timed_out = recording_start_wd
+                        .lock()
+                        .unwrap()
+                        .map(|start| start.elapsed() > max_rec)
+                        .unwrap_or(false);
+                    if timed_out {
+                        drop(rec_state);
+                        // #5: watchdog timeout (only fires on actual timeout, not every second)
+                        eprintln!(
+                            "[HOTKEY] watchdog timeout: recording exceeded {}s, force-stopping stuck recording",
+                            max_rec.as_secs()
+                        );
+                        is_recording_wd.store(false, std::sync::atomic::Ordering::SeqCst);
+                        *state_wd.lock().unwrap() = RecordingState::Idle;
+                        *recording_start_wd.lock().unwrap() = None;
 
-            #[cfg(target_os = "linux")]
-            {
+                        // Pause audio stream
+                        {
+                            let stream_guard = persistent_stream_wd.lock().unwrap();
+                            if let Some(ref stream) = *stream_guard {
+                                let _ = stream.pause();
+                            }
+                        }
+
+                        // Restore system volume
+                        volume_controller_wd.restore();
+                    }
+                }
+            }
+        });
+
+        // Windows: rdev::listen runs the callback on the OS WH_KEYBOARD_LL hook
+        // thread, which has a strict timeout (LowLevelHooksTimeout, ~5s). The
+        // callback does heavy work (waits up to 10s for previous transcription,
+        // spawns powershell for volume control, etc.), so we offload it to a
+        // worker thread via a channel — same pattern as macOS grab_fn.
+        //
+        // Linux uses listen(callback) directly: rdev's X11 listener runs in its
+        // own thread already, no hook timeout, so direct invocation is fine.
+        #[cfg(target_os = "windows")]
+        {
+            let (event_tx, event_rx) = std::sync::mpsc::channel::<Event>();
+
+            #[allow(unused_mut)]
+            let mut callback = callback;
+            let send_worker = SendCallback(move || {
+                while let Ok(event) = event_rx.recv() {
+                    callback(event);
+                }
+            });
+            thread::spawn(move || send_worker.run());
+
+            let forward = move |event: Event| {
+                let _ = event_tx.send(event);
+            };
+
+            if let Err(e) = listen(forward) {
+                eprintln!("Error: {:?}", e);
+                eprintln!("\nOn Windows, try running as Administrator.");
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            if let Err(e) = listen(callback) {
+                eprintln!("Error: {:?}", e);
                 eprintln!();
                 eprintln!("On Linux, make sure you have the necessary permissions.");
                 eprintln!("Try running with sudo or adding your user to the 'input' group:");
                 eprintln!("  sudo usermod -aG input $USER");
                 eprintln!("Then log out and back in.");
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                eprintln!("\nOn Windows, try running as Administrator.");
             }
         }
     }
@@ -1579,7 +1655,7 @@ fn transcribe_openai_internal(
     prompt: Option<&str>,
     use_ogg: bool,
 ) -> Result<(String, String), String> {
-    let mut last_error = String::new();
+    let mut last_error: String;
 
     // First attempt
     match transcribe_openai_single_attempt(config, samples, sample_rate, prompt, use_ogg) {
@@ -2561,6 +2637,17 @@ fn download_model_with_fallback(model_name: &str) -> Result<PathBuf, String> {
 // ============================================================================
 
 fn main() {
+    // Defensive: detach from any inherited/allocated console on Windows.
+    // Must run before any other operations to prevent console window flicker.
+    // FreeConsole returns 0 if no console was attached (safe to ignore).
+    #[cfg(target_os = "windows")]
+    {
+        extern "system" {
+            fn FreeConsole() -> i32;
+        }
+        unsafe { FreeConsole(); }
+    }
+
     // Load .env early so VOICE_KEYBOARD_* vars are available before any env::var calls
     let _ = dotenvy::dotenv();
     let env_path = get_data_dir().join(".env");
@@ -2571,8 +2658,6 @@ fn main() {
     let config = load_config();
     let args: Vec<String> = env::args().collect();
     let mut model_arg: Option<String> = config.model.clone();
-    let mut use_openai = false;
-    let mut use_openrouter = false;
     let mut backend_order: Vec<BackendKind> = Vec::new();
     let mut cli_mode = false; // CLI mode (advanced, requires --cli flag)
 
@@ -2669,13 +2754,11 @@ fn main() {
                 input_method = InputMethod::Keyboard;
             }
             "--openai" => {
-                use_openai = true;
                 if !backend_order.contains(&BackendKind::OpenAI) {
                     backend_order.push(BackendKind::OpenAI);
                 }
             }
             "--openrouter" => {
-                use_openrouter = true;
                 if !backend_order.contains(&BackendKind::OpenRouter) {
                     backend_order.push(BackendKind::OpenRouter);
                 }
@@ -2883,6 +2966,9 @@ fn main() {
         launch_gui();
         return;
     }
+    // cli_mode is only meaningful when the `gui` feature is active; suppress unused warning
+    #[cfg(not(feature = "gui"))]
+    let _ = cli_mode;
 
     // CLI mode continues below...
     let input_mode_str = match input_method {
@@ -4652,18 +4738,29 @@ impl DevReport {
             "{}:{}/{}",
             DEV_REPORT_SERVER, DEV_REPORT_PATH, self.session_id
         );
-        let _ = Command::new("ssh")
-            .arg(DEV_REPORT_SERVER)
-            .arg(format!("mkdir -p {}/{}", DEV_REPORT_PATH, self.session_id))
-            .output();
+        let mut ssh_cmd = Command::new("ssh");
+        ssh_cmd.arg(DEV_REPORT_SERVER)
+            .arg(format!("mkdir -p {}/{}", DEV_REPORT_PATH, self.session_id));
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            ssh_cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let _ = ssh_cmd.output();
 
         // Upload only JSON report (no audio files - they stay local)
         let json_path = self.report_dir.join("report.json");
         if json_path.exists() {
-            match Command::new("scp")
-                .arg(&json_path)
-                .arg(&mkdir_dest)
-                .output()
+            let mut scp_cmd = Command::new("scp");
+            scp_cmd.arg(&json_path).arg(&mkdir_dest);
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x08000000;
+                scp_cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            match scp_cmd.output()
             {
                 Ok(output) => {
                     if output.status.success() {
@@ -4768,6 +4865,33 @@ fn run_openai(
                 key2.name()
             );
         }
+    }
+
+    // #1 / #9: Listener startup + config diagnostic
+    {
+        let hotkey_source = if std::env::args().any(|a| a.starts_with("--key")) {
+            "CLI --key arg"
+        } else if std::env::var("VOICE_KEYBOARD_HOTKEY").is_ok() {
+            "VOICE_KEYBOARD_HOTKEY env"
+        } else {
+            "default_for_platform"
+        };
+        eprintln!(
+            "[HOTKEY] listener starting: trigger_key={:?} ({}) extra_keys={} max_recording_duration={}s platform={}",
+            hotkey.to_rdev_key(),
+            hotkey.name(),
+            extra_keys,
+            max_recording_duration().as_secs(),
+            if cfg!(target_os = "windows") { "windows" }
+            else if cfg!(target_os = "macos") { "macos" }
+            else { "linux" }
+        );
+        eprintln!(
+            "[HOTKEY] config: trigger_key='{}' rdev_key={:?} (from {})",
+            hotkey.name(),
+            hotkey.to_rdev_key(),
+            hotkey_source
+        );
     }
 
     let config = Arc::new(openai_config);
@@ -6098,6 +6222,7 @@ fn run_openai(
     let vad_clone = Arc::clone(&vad);
     let next_sequence_clone = Arc::clone(&next_sequence);
     let processing_count_clone = Arc::clone(&processing_count);
+    let job_tx_stdin = job_tx.clone(); // cloned for stdin reader thread (below callback)
     let job_tx_callback = job_tx;
     let dev_report_callback = Arc::clone(&dev_report);
     let config_callback = Arc::clone(&config);
@@ -6116,17 +6241,77 @@ fn run_openai(
     let key_debounce = Arc::new(AtomicBool::new(false));
     let key_debounce_clone = Arc::clone(&key_debounce);
 
+    // Auto-repeat suppression: Windows fires WM_KEYDOWN every ~30ms while a
+    // key is held (modifiers included on many systems). Without this filter
+    // each repeat hits the "force-reset on Recording" path below and bounces
+    // the recording state Idle→Recording every 200ms, drowning the actual
+    // KeyRelease in the queue. We treat any press within 250ms of the
+    // previous one as auto-repeat and ignore it.
+    let last_press_instant: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let last_press_instant_clone = Arc::clone(&last_press_instant);
+
     let callback = move |event: Event| {
         use std::sync::atomic::Ordering;
 
-        // NOTE: Recording timeout (120s) is handled by start_hotkey_listener's grab_fn.
-        // It resets state to Idle, pauses the stream, and restores volume before the
-        // event reaches this callback.
+        // NOTE: Recording timeout (120s) is handled by start_hotkey_listener:
+        // - macOS: via grab_fn (triggered on any keyboard event)
+        // - Windows/Linux: via watchdog thread (proactive 1-second polling)
+
+        // #2: Raw key event logging for all KeyPress/KeyRelease (NOT mouse)
+        {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            match &event.event_type {
+                EventType::KeyPress(k) => {
+                    eprintln!(
+                        "[HOTKEY] {} press k={:?} name={:?} state={:?} is_recording={} debounce={}",
+                        now_ms, k, event.name,
+                        *state_clone.lock().unwrap(),
+                        is_recording_clone.load(Ordering::SeqCst),
+                        key_debounce_clone.load(Ordering::SeqCst)
+                    );
+                }
+                EventType::KeyRelease(k) => {
+                    eprintln!(
+                        "[HOTKEY] {} release k={:?} name={:?} state={:?} is_recording={} debounce={}",
+                        now_ms, k, event.name,
+                        *state_clone.lock().unwrap(),
+                        is_recording_clone.load(Ordering::SeqCst),
+                        key_debounce_clone.load(Ordering::SeqCst)
+                    );
+                }
+                _ => {} // mouse and other events — skip to avoid log flood
+            }
+        }
 
         match event.event_type {
             EventType::KeyPress(key)
                 if key == target_key || target_key2 == Some(key) || target_key3 == Some(key) =>
             {
+                // #3: trigger_key matched (press)
+                eprintln!("[HOTKEY] trigger_key matched: action=press key={:?}", key);
+
+                // Auto-repeat filter: drop the event if the previous press
+                // landed less than 250ms ago. See last_press_instant comment
+                // above the callback for context.
+                {
+                    let now = Instant::now();
+                    let mut last = last_press_instant_clone.lock().unwrap();
+                    if let Some(prev) = *last {
+                        if now.duration_since(prev) < Duration::from_millis(250) {
+                            eprintln!(
+                                "[HOTKEY] auto-repeat suppressed ({}ms since last press)",
+                                now.duration_since(prev).as_millis()
+                            );
+                            *last = Some(now);
+                            return;
+                        }
+                    }
+                    *last = Some(now);
+                }
+
                 // Force-reset if stuck in Recording (lost KeyRelease recovery).
                 // Must check BEFORE debounce: when KeyRelease is lost, key_debounce
                 // stays true, so swap(true) would return true and hit early-return,
@@ -6134,6 +6319,8 @@ fn run_openai(
                 {
                     let mut rec_state = state_clone.lock().unwrap();
                     if *rec_state == RecordingState::Recording {
+                        // #4: force-reset start
+                        eprintln!("[HOTKEY] force-reset: state was Recording, stopping stream and resetting debounce");
                         eprintln!(
                             "[{}] WARNING: Forced reset — key pressed while already Recording (lost key_release event)",
                             timestamp()
@@ -6153,16 +6340,33 @@ fn run_openai(
                         // Restore system volume
                         volume_controller_clone.restore();
 
-                        // Reset debounce so the next press starts fresh
+                        // Reset debounce and fall through to start a new recording.
+                        // Do NOT return here — the current press should immediately
+                        // start a fresh recording so the user doesn't need an extra press.
                         key_debounce_clone.store(false, Ordering::SeqCst);
-                        // Small delay before allowing a new recording
+                        // Small delay before starting a new recording
                         thread::sleep(Duration::from_millis(200));
-                        return;
+                        // Fall through — state is now Idle, debounce is false
+                        // #4: force-reset complete
+                        eprintln!("[HOTKEY] force-reset complete, falling through to start new recording");
                     }
                 }
 
+                // Debounce: ignore key-repeat events while recording.
+                // Exception: if debounce is true but state is Idle, the debounce is
+                // stale (e.g., leftover after watchdog timeout recovery that reset state
+                // without going through KeyRelease). Allow the press to proceed.
                 if key_debounce_clone.swap(true, Ordering::SeqCst) {
-                    return; // Already pressed, ignore repeat
+                    let rec_state = state_clone.lock().unwrap();
+                    if *rec_state == RecordingState::Recording {
+                        // #8: genuine debounce block
+                        eprintln!("[HOTKEY] debounce-blocked: state=Recording (genuine repeat) -> ignoring press");
+                        return; // Genuine key-repeat while recording — ignore
+                    }
+                    // state is Idle — debounce is stale, proceed with new recording
+                    // key_debounce is already true (set by swap above), which is correct
+                    // #8: stale debounce
+                    eprintln!("[HOTKEY] debounce stale: state=Idle, debounce=true -> proceeding with new recording");
                 }
 
                 // Check for pending retry job first
@@ -6224,51 +6428,34 @@ fn run_openai(
                 // Start recording if idle
                 let mut rec_state = state_clone.lock().unwrap();
                 if *rec_state == RecordingState::Idle {
-                    // Wait for any pending processing to complete before starting new session
+                    // If a previous transcription is still processing, just log it —
+                    // do NOT block here. Blocking the hotkey worker thread freezes
+                    // user interaction (presses queue up, recording starts seconds
+                    // late, etc.). The transcription pipeline tolerates overlap:
+                    // - Each TranscriptionJob carries its own samples copy.
+                    // - sequence_num is a monotonic atomic counter, so new chunks
+                    //   get higher seq than old ones; the output thread sorts by
+                    //   seq via BTreeMap and emits in order.
+                    // We clear the shared audio buffer and reset VAD because the
+                    // mic stream is paused between recordings (no concurrent
+                    // writers), but we leave next_sequence / next_output_seq
+                    // alone — resetting them to 0 would collide with in-flight
+                    // jobs from the previous session.
                     let pending = processing_count_clone.load(Ordering::SeqCst);
                     let job_seq = next_sequence_clone.load(Ordering::SeqCst);
                     let output_seq = next_output_seq_for_callback.load(Ordering::SeqCst);
-
                     if pending > 0 || output_seq < job_seq {
                         println!(
-                            "[{}] Waiting for previous session: {} pending transcriptions, output_seq={} job_seq={}",
+                            "[{}] Previous transcription still in flight ({} pending, output_seq={} job_seq={}) — starting new recording anyway",
                             timestamp(),
                             pending,
                             output_seq,
                             job_seq
                         );
-                        drop(rec_state); // Release lock while waiting
-
-                        // Wait for both: transcriptions to finish AND output to process all results
-                        let wait_start = Instant::now();
-                        loop {
-                            thread::sleep(Duration::from_millis(50));
-                            if wait_start.elapsed() > Duration::from_secs(10) {
-                                eprintln!(
-                                    "[{}] WARNING: Timed out waiting for previous transcription (10s), proceeding anyway",
-                                    timestamp()
-                                );
-                                break;
-                            }
-                            let p = processing_count_clone.load(Ordering::SeqCst);
-                            let j = next_sequence_clone.load(Ordering::SeqCst);
-                            let o = next_output_seq_for_callback.load(Ordering::SeqCst);
-                            if p == 0 && o >= j {
-                                break;
-                            }
-                        }
-                        // Small delay to let typing events channel flush
-                        thread::sleep(Duration::from_millis(100));
-                        rec_state = state_clone.lock().unwrap();
-                        // Re-check state after waiting
-                        if *rec_state != RecordingState::Idle {
-                            return; // State changed while waiting, abort
-                        }
                     }
+
                     samples_clone.lock().unwrap().clear();
                     vad_clone.lock().unwrap().reset();
-                    next_sequence_clone.store(0, Ordering::SeqCst); // Reset sequence for new session
-                    next_output_seq_for_callback.store(0, Ordering::SeqCst); // Reset output sequence too
                     active_preprompt_callback.store(0, Ordering::SeqCst); // Reset preprompt index
                     *recording_start_clone.lock().unwrap() = Some(Instant::now());
                     is_recording_clone.store(true, Ordering::SeqCst);
@@ -6306,6 +6493,8 @@ fn run_openai(
                         *dev_report_callback.lock().unwrap() = Some(new_report);
                     }
 
+                    // #6: recording started
+                    eprintln!("[HOTKEY] recording STARTED");
                     println!("[{}] Recording...", timestamp());
                     std::io::stdout().flush().ok();
                     // No start beep - it would be captured in the recording
@@ -6329,6 +6518,8 @@ fn run_openai(
             EventType::KeyRelease(key)
                 if key == target_key || target_key2 == Some(key) || target_key3 == Some(key) =>
             {
+                // #3: trigger_key matched (release)
+                eprintln!("[HOTKEY] trigger_key matched: action=release key={:?}", key);
                 key_debounce_clone.store(false, Ordering::SeqCst);
 
                 // Check if currently recording
@@ -6336,6 +6527,8 @@ fn run_openai(
                 if *rec_state == RecordingState::Recording {
                     is_recording_clone.store(false, Ordering::SeqCst);
                     *rec_state = RecordingState::Idle;
+                    // #7: recording stopped via KeyRelease
+                    eprintln!("[HOTKEY] recording STOPPED via KeyRelease");
 
                     // Pause persistent stream to hide macOS microphone indicator (instant)
                     {
@@ -6569,6 +6762,272 @@ fn run_openai(
         println!("  1. Install: vcpkg install opus");
         println!("  2. Rebuild: cargo build --features opus");
         println!("");
+    }
+
+    // Stdin reader thread: receives TEST_PRESS / TEST_RELEASE commands from Tauri
+    // when user clicks the big record button in the UI (mouse-based push-to-talk).
+    // Uses SendCallback wrapper on macOS because cpal::Stream is !Send on CoreAudio.
+    {
+        use std::sync::atomic::Ordering;
+        let state_stdin = Arc::clone(&state);
+        let is_recording_stdin = Arc::clone(&is_recording);
+        let persistent_stream_stdin = Arc::clone(&persistent_stream);
+        let volume_controller_stdin = Arc::clone(&volume_controller);
+        let recording_start_stdin = Arc::clone(&recording_start);
+        let samples_stdin = Arc::clone(&samples);
+        let vad_stdin = Arc::clone(&vad);
+        let next_sequence_stdin = Arc::clone(&next_sequence);
+        let processing_count_stdin = Arc::clone(&processing_count);
+        let output_mode_stdin = Arc::clone(&output_mode);
+        let active_preprompt_stdin = Arc::clone(&active_preprompt_index);
+
+        #[cfg(target_os = "macos")]
+        let worker = SendCallback(move || {
+            use std::io::BufRead;
+            let stdin_handle = std::io::stdin();
+            for line in stdin_handle.lock().lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                eprintln!("[HOTKEY] stdin command received: {}", line.trim());
+                match line.trim() {
+                    "TEST_PRESS" => {
+                        let mut rec_state = state_stdin.lock().unwrap();
+                        if *rec_state == RecordingState::Recording {
+                            eprintln!("[HOTKEY] stdin TEST_PRESS: force-reset (was Recording)");
+                            is_recording_stdin.store(false, Ordering::SeqCst);
+                            *rec_state = RecordingState::Idle;
+                            drop(rec_state);
+                            {
+                                let sg = persistent_stream_stdin.lock().unwrap();
+                                if let Some(ref s) = *sg { let _ = s.pause(); }
+                            }
+                            volume_controller_stdin.restore();
+                            thread::sleep(Duration::from_millis(200));
+                            rec_state = state_stdin.lock().unwrap();
+                        }
+                        if *rec_state == RecordingState::Idle {
+                            samples_stdin.lock().unwrap().clear();
+                            vad_stdin.lock().unwrap().reset();
+                            next_sequence_stdin.store(0, Ordering::SeqCst);
+                            active_preprompt_stdin.store(0, Ordering::SeqCst);
+                            *recording_start_stdin.lock().unwrap() = Some(Instant::now());
+                            is_recording_stdin.store(true, Ordering::SeqCst);
+                            *rec_state = RecordingState::Recording;
+                            drop(rec_state);
+                            {
+                                let sg = persistent_stream_stdin.lock().unwrap();
+                                if let Some(ref s) = *sg {
+                                    if let Err(e) = s.play() {
+                                        eprintln!("[HOTKEY] stdin: failed to play stream: {}", e);
+                                        is_recording_stdin.store(false, Ordering::SeqCst);
+                                        *state_stdin.lock().unwrap() = RecordingState::Idle;
+                                        continue;
+                                    }
+                                }
+                            }
+                            volume_controller_stdin.lower();
+                            eprintln!("[HOTKEY] stdin: recording STARTED via TEST_PRESS");
+                            println!("[{}] Recording...", timestamp());
+                            std::io::stdout().flush().ok();
+                        }
+                    }
+                    "TEST_RELEASE" => {
+                        let mut rec_state = state_stdin.lock().unwrap();
+                        if *rec_state == RecordingState::Recording {
+                            is_recording_stdin.store(false, Ordering::SeqCst);
+                            *rec_state = RecordingState::Idle;
+                            eprintln!("[HOTKEY] stdin: recording STOPPED via TEST_RELEASE");
+                            drop(rec_state);
+                            {
+                                let sg = persistent_stream_stdin.lock().unwrap();
+                                if let Some(ref s) = *sg { let _ = s.pause(); }
+                            }
+                            volume_controller_stdin.restore();
+
+                            let recording_duration = recording_start_stdin
+                                .lock()
+                                .unwrap()
+                                .map(|start| start.elapsed())
+                                .unwrap_or(Duration::ZERO);
+
+                            if recording_duration < Duration::from_millis(min_recording_ms) {
+                                println!("[{}] Recording too short, ignoring", timestamp());
+                                std::io::stdout().flush().ok();
+                                continue;
+                            }
+
+                            let phrase_opt = {
+                                let smp = samples_stdin.lock().unwrap();
+                                if !smp.is_empty() {
+                                    let duration_ms =
+                                        smp.len() as f32 / RECORDING_SAMPLE_RATE as f32 * 1000.0;
+                                    println!(
+                                        "[VAD] stdin-release: sending full audio ({:.0}ms)",
+                                        duration_ms
+                                    );
+                                    Some((smp.clone(), 0usize, smp.len()))
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some((phrase_samples, start_pos, end_pos)) = phrase_opt {
+                                let seq = next_sequence_stdin.fetch_add(1, Ordering::SeqCst);
+                                processing_count_stdin.fetch_add(1, Ordering::SeqCst);
+                                let current_mode = output_mode_stdin.load(Ordering::SeqCst);
+                                let current_preprompt =
+                                    active_preprompt_stdin.load(Ordering::SeqCst);
+                                let _ = job_tx_stdin.send(TranscriptionJob {
+                                    samples: phrase_samples,
+                                    sequence_num: seq,
+                                    start_sample: start_pos,
+                                    end_sample: end_pos,
+                                    output_mode: current_mode,
+                                    selected_text: None,
+                                    preprompt_index: current_preprompt,
+                                    #[cfg(target_os = "macos")]
+                                    target_pid: None,
+                                });
+                                println!(
+                                    "[{}] stdin-release: queued audio (seq={})",
+                                    timestamp(), seq
+                                );
+                                std::io::stdout().flush().ok();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            eprintln!("[HOTKEY] stdin reader thread exiting (EOF)");
+        });
+        #[cfg(target_os = "macos")]
+        thread::spawn(move || worker.run());
+
+        #[cfg(not(target_os = "macos"))]
+        thread::spawn(move || {
+            use std::io::BufRead;
+            let stdin_handle = std::io::stdin();
+            for line in stdin_handle.lock().lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                eprintln!("[HOTKEY] stdin command received: {}", line.trim());
+                match line.trim() {
+                    "TEST_PRESS" => {
+                        let mut rec_state = state_stdin.lock().unwrap();
+                        if *rec_state == RecordingState::Recording {
+                            eprintln!("[HOTKEY] stdin TEST_PRESS: force-reset (was Recording)");
+                            is_recording_stdin.store(false, Ordering::SeqCst);
+                            *rec_state = RecordingState::Idle;
+                            drop(rec_state);
+                            {
+                                let sg = persistent_stream_stdin.lock().unwrap();
+                                if let Some(ref s) = *sg { let _ = s.pause(); }
+                            }
+                            volume_controller_stdin.restore();
+                            thread::sleep(Duration::from_millis(200));
+                            rec_state = state_stdin.lock().unwrap();
+                        }
+                        if *rec_state == RecordingState::Idle {
+                            samples_stdin.lock().unwrap().clear();
+                            vad_stdin.lock().unwrap().reset();
+                            next_sequence_stdin.store(0, Ordering::SeqCst);
+                            active_preprompt_stdin.store(0, Ordering::SeqCst);
+                            *recording_start_stdin.lock().unwrap() = Some(Instant::now());
+                            is_recording_stdin.store(true, Ordering::SeqCst);
+                            *rec_state = RecordingState::Recording;
+                            drop(rec_state);
+                            {
+                                let sg = persistent_stream_stdin.lock().unwrap();
+                                if let Some(ref s) = *sg {
+                                    if let Err(e) = s.play() {
+                                        eprintln!("[HOTKEY] stdin: failed to play stream: {}", e);
+                                        is_recording_stdin.store(false, Ordering::SeqCst);
+                                        *state_stdin.lock().unwrap() = RecordingState::Idle;
+                                        continue;
+                                    }
+                                }
+                            }
+                            volume_controller_stdin.lower();
+                            eprintln!("[HOTKEY] stdin: recording STARTED via TEST_PRESS");
+                            println!("[{}] Recording...", timestamp());
+                            std::io::stdout().flush().ok();
+                        }
+                    }
+                    "TEST_RELEASE" => {
+                        let mut rec_state = state_stdin.lock().unwrap();
+                        if *rec_state == RecordingState::Recording {
+                            is_recording_stdin.store(false, Ordering::SeqCst);
+                            *rec_state = RecordingState::Idle;
+                            eprintln!("[HOTKEY] stdin: recording STOPPED via TEST_RELEASE");
+                            drop(rec_state);
+                            {
+                                let sg = persistent_stream_stdin.lock().unwrap();
+                                if let Some(ref s) = *sg { let _ = s.pause(); }
+                            }
+                            volume_controller_stdin.restore();
+
+                            let recording_duration = recording_start_stdin
+                                .lock()
+                                .unwrap()
+                                .map(|start| start.elapsed())
+                                .unwrap_or(Duration::ZERO);
+
+                            if recording_duration < Duration::from_millis(min_recording_ms) {
+                                println!("[{}] Recording too short, ignoring", timestamp());
+                                std::io::stdout().flush().ok();
+                                continue;
+                            }
+
+                            let phrase_opt = {
+                                let smp = samples_stdin.lock().unwrap();
+                                if !smp.is_empty() {
+                                    let duration_ms =
+                                        smp.len() as f32 / RECORDING_SAMPLE_RATE as f32 * 1000.0;
+                                    println!(
+                                        "[VAD] stdin-release: sending full audio ({:.0}ms)",
+                                        duration_ms
+                                    );
+                                    Some((smp.clone(), 0usize, smp.len()))
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some((phrase_samples, start_pos, end_pos)) = phrase_opt {
+                                let seq = next_sequence_stdin.fetch_add(1, Ordering::SeqCst);
+                                processing_count_stdin.fetch_add(1, Ordering::SeqCst);
+                                let current_mode = output_mode_stdin.load(Ordering::SeqCst);
+                                let current_preprompt =
+                                    active_preprompt_stdin.load(Ordering::SeqCst);
+                                let _ = job_tx_stdin.send(TranscriptionJob {
+                                    samples: phrase_samples,
+                                    sequence_num: seq,
+                                    start_sample: start_pos,
+                                    end_sample: end_pos,
+                                    output_mode: current_mode,
+                                    selected_text: None,
+                                    preprompt_index: current_preprompt,
+                                    #[cfg(target_os = "macos")]
+                                    target_pid: None,
+                                });
+                                println!(
+                                    "[{}] stdin-release: queued audio (seq={})",
+                                    timestamp(), seq
+                                );
+                                std::io::stdout().flush().ok();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            eprintln!("[HOTKEY] stdin reader thread exiting (EOF)");
+        });
     }
 
     start_hotkey_listener(

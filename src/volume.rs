@@ -4,8 +4,9 @@
 //! Platform support:
 //!   - macOS: `osascript` (AppleScript)
 //!   - Linux: `pactl` (PulseAudio/PipeWire)
-//!   - Windows: PowerShell audio commands
+//!   - Windows: direct winmm.dll FFI (waveOutGet/SetVolume)
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -45,17 +46,23 @@ fn get_system_volume() -> Option<u32> {
 
     #[cfg(target_os = "windows")]
     {
-        // Use nircmd (widely available) or fall back to none
-        let output = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public class Vol { [DllImport(\"winmm.dll\")] public static extern int waveOutGetVolume(IntPtr hwo, out uint dwVolume); }'; $v = 0u; [Vol]::waveOutGetVolume([IntPtr]::Zero, [ref]$v); [math]::Round(($v -band 0xFFFF) / 65535 * 100)",
-            ])
-            .output()
-            .ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout.trim().parse::<u32>().ok()
+        // Direct winmm.dll FFI. Earlier this shelled out to `powershell.exe`
+        // running the same Add-Type Add-Type winmm wrapper, which cost
+        // 500-1000ms per call (PowerShell startup + JIT). With volume
+        // control invoked from the hotkey worker on every record-start /
+        // record-stop, that delay was visible to the user as "recording
+        // doesn't start until ~2s after the press." The native call here
+        // is sub-millisecond.
+        extern "system" {
+            fn waveOutGetVolume(hwo: *mut std::ffi::c_void, pdwVolume: *mut u32) -> u32;
+        }
+        let mut v: u32 = 0;
+        let result = unsafe { waveOutGetVolume(std::ptr::null_mut(), &mut v) };
+        if result != 0 {
+            return None;
+        }
+        let left = v & 0xFFFF;
+        Some(((left as f64 / 65535.0) * 100.0).round() as u32)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -84,15 +91,15 @@ fn set_system_volume(volume: u32) {
 
     #[cfg(target_os = "windows")]
     {
+        // Direct winmm.dll FFI — see get_system_volume() for context.
+        extern "system" {
+            fn waveOutSetVolume(hwo: *mut std::ffi::c_void, dwVolume: u32) -> u32;
+        }
         let val = (vol as f64 / 100.0 * 65535.0) as u32;
         let both = val | (val << 16);
-        let cmd = format!(
-            "Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public class Vol {{ [DllImport(\"winmm.dll\")] public static extern int waveOutSetVolume(IntPtr hwo, uint dwVolume); }}'; [Vol]::waveOutSetVolume([IntPtr]::Zero, 0x{:08X})",
-            both
-        );
-        let _ = Command::new("powershell")
-            .args(["-NoProfile", "-Command", &cmd])
-            .output();
+        unsafe {
+            waveOutSetVolume(std::ptr::null_mut(), both);
+        }
     }
 }
 

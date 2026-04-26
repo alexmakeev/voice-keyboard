@@ -6,8 +6,12 @@
 //! Usage:
 //!   cargo run --bin voice-recorder
 
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
+
+#[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
@@ -17,9 +21,11 @@ use rdev::{listen, Event, EventType, Key};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 /// Double-tap detection timeout
+#[cfg(target_os = "macos")]
 const DOUBLE_TAP_TIMEOUT_MS: u64 = 500;
 
 /// Recording state
+#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum RecordingState {
     Idle,
@@ -239,6 +245,7 @@ fn start_recording(samples: Arc<Mutex<Vec<f32>>>) -> Result<cpal::Stream, String
     Ok(stream)
 }
 
+#[cfg(target_os = "macos")]
 fn save_and_paste_ogg(samples: &[f32]) -> Result<PathBuf, String> {
     // Save to temp file as WAV (OGG encoding will be added later)
     let temp_dir = std::env::temp_dir();
@@ -254,6 +261,7 @@ fn save_and_paste_ogg(samples: &[f32]) -> Result<PathBuf, String> {
     Ok(wav_path)
 }
 
+#[cfg(target_os = "macos")]
 fn save_wav(samples: &[f32], path: &PathBuf) -> Result<(), String> {
     let spec = hound::WavSpec {
         channels: 1,
@@ -320,6 +328,7 @@ fn copy_file_to_clipboard_and_paste(path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn timestamp() -> String {
     use std::time::SystemTime;
     let now = SystemTime::now()
