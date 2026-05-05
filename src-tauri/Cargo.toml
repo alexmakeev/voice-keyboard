@@ -22,24 +22,12 @@ tauri-plugin-fs = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Whisper speech recognition
-whisper-rs = { version = "0.15", optional = true }
-
 # Image decoding (for tray icon)
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Audio
 hound = "3.5"
 cpal = "0.15"
-
-# Clipboard
-arboard = "3"
-
-# Global hotkeys
-rdev = "0.5"
-
-# Keyboard simulation
-enigo = "0.2"
 
 # Async
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
@@ -79,9 +67,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 macos-private-api = ["tauri/macos-private-api"]
-whisper = ["whisper-rs"]
-metal = ["whisper-rs/metal"]
-coreml = ["whisper-rs/coreml"]
 
 [profile.release]
 lto = true

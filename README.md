@@ -453,7 +453,8 @@ Install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cp
 ## Configuration File
 
 Location:
-- macOS/Linux: `~/.config/voice-keyboard/config.json`
+- macOS: `~/Library/Application Support/voice-keyboard/config.json`
+- Linux: `~/.config/voice-keyboard/config.json`
 - Windows: `%APPDATA%\voice-keyboard\config.json`
 
 Example:

@@ -20,8 +20,6 @@ use tauri::{
 #[cfg(not(target_os = "macos"))]
 use tauri::tray::{MouseButton, TrayIconEvent};
 
-mod audio;
-mod whisper;
 mod debug_log;
 
 /// Information about a software update
@@ -60,6 +58,9 @@ use debug_log::DebugLog;
 
 /// Maximum debug log lines kept in memory
 const MAX_DEBUG_LINES: usize = 5000;
+
+const GITHUB_OWNER: &str = "alexmakeev";
+const GITHUB_REPO: &str = "voice-keyboard";
 
 /// Application state shared across commands
 struct AppState {
@@ -621,7 +622,9 @@ async fn open_github_issue(zip_path: String) -> Result<(), String> {
     );
 
     let url = format!(
-        "https://github.com/alexmakeev/voice-keyboard/issues/new?title={}&body={}",
+        "https://github.com/{}/{}/issues/new?title={}&body={}",
+        GITHUB_OWNER,
+        GITHUB_REPO,
         urlencoding::encode(&title),
         urlencoding::encode(&body)
     );
@@ -785,7 +788,7 @@ async fn do_update_check(current_version: &str) -> Result<UpdateInfo, String> {
         .map_err(|e| e.to_string())?;
 
     let response = client
-        .get("https://api.github.com/repos/alexmakeev/voice-keyboard/releases/latest")
+        .get(format!("https://api.github.com/repos/{}/{}/releases/latest", GITHUB_OWNER, GITHUB_REPO))
         .header("User-Agent", "voice-keyboard-app")
         .send()
         .await
