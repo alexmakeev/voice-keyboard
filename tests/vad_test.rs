@@ -3,8 +3,8 @@
 
 use std::path::PathBuf;
 use voice_keyboard::vad::{
-    VadPhraseDetector, MIN_FRAGMENT_DURATION_MS, MIN_VOICE_RATIO_FOR_SPEECH,
-    VAD_ENERGY_THRESHOLD, VAD_MIN_SPEECH_MS, VAD_SILENCE_MS, VAD_WINDOW_MS,
+    VadPhraseDetector, MIN_FRAGMENT_DURATION_MS, MIN_VOICE_RATIO_FOR_SPEECH, VAD_ENERGY_THRESHOLD,
+    VAD_MIN_SPEECH_MS, VAD_SILENCE_MS, VAD_WINDOW_MS,
 };
 
 /// Load WAV at `rel_path` (relative to test_data/), return (mono f32 samples, sample_rate).
@@ -33,10 +33,7 @@ fn load_wav(rel_path: &str) -> (Vec<f32>, u32) {
 }
 
 /// Drive `detect_phrase` to completion against the full sample buffer.
-fn collect_phrases(
-    vad: &mut VadPhraseDetector,
-    samples: &[f32],
-) -> Vec<(Vec<f32>, usize, usize)> {
+fn collect_phrases(vad: &mut VadPhraseDetector, samples: &[f32]) -> Vec<(Vec<f32>, usize, usize)> {
     let mut out = Vec::new();
     while let Some(p) = vad.detect_phrase(samples) {
         out.push(p);
@@ -85,8 +82,11 @@ fn test_vad_short_speech_buffered() {
     let mut vad = VadPhraseDetector::new(16000);
     let phrases = collect_phrases(&mut vad, &samples);
     // Short fragment is buffered, not emitted.
-    assert!(phrases.is_empty(),
-        "expected empty (buffered), got {} phrases", phrases.len());
+    assert!(
+        phrases.is_empty(),
+        "expected empty (buffered), got {} phrases",
+        phrases.len()
+    );
     // Buffered position should be set or detection continued past it.
     // (Documents the buffering behaviour; exact field state depends on algorithm internals.)
 }
@@ -100,8 +100,10 @@ fn test_vad_long_phrase_emitted_inline() {
 
     let mut vad = VadPhraseDetector::new(16000);
     let phrases = collect_phrases(&mut vad, &samples);
-    assert!(!phrases.is_empty(),
-        "expected at least 1 phrase from 1500ms 200Hz sine + 500ms silence");
+    assert!(
+        !phrases.is_empty(),
+        "expected at least 1 phrase from 1500ms 200Hz sine + 500ms silence"
+    );
 }
 
 #[test]
@@ -113,12 +115,18 @@ fn test_vad_real_speech_russian_10s() {
     if let Some(rem) = vad.get_remaining(&samples) {
         phrases.push(rem);
     }
-    assert!(!phrases.is_empty(),
-        "expected at least 1 phrase from 10s of real Russian speech");
+    assert!(
+        !phrases.is_empty(),
+        "expected at least 1 phrase from 10s of real Russian speech"
+    );
     for (i, (p, _, _)) in phrases.iter().enumerate() {
         let dur_ms = p.len() as f64 * 1000.0 / sr as f64;
-        assert!(dur_ms >= (VAD_MIN_SPEECH_MS as f64) - 50.0,
-            "phrase {} too short: {}ms", i, dur_ms);
+        assert!(
+            dur_ms >= (VAD_MIN_SPEECH_MS as f64) - 50.0,
+            "phrase {} too short: {}ms",
+            i,
+            dur_ms
+        );
         eprintln!("phrase {}: {:.0}ms", i, dur_ms);
     }
 }
@@ -132,8 +140,11 @@ fn test_vad_real_speech_russian_30s() {
     if let Some(rem) = vad.get_remaining(&samples) {
         phrases.push(rem);
     }
-    assert!(phrases.len() >= 2,
-        "expected >=2 phrases from 30s real speech, got {}", phrases.len());
+    assert!(
+        phrases.len() >= 2,
+        "expected >=2 phrases from 30s real speech, got {}",
+        phrases.len()
+    );
 }
 
 #[test]
@@ -142,8 +153,11 @@ fn test_vad_real_speech_english() {
     let mut vad = VadPhraseDetector::new(sr);
     let phrases = collect_phrases(&mut vad, &samples);
     let remaining = vad.get_remaining(&samples);
-    assert!(!phrases.is_empty() || remaining.is_some(),
-        "expected at least 1 phrase OR pending fragment from english_test.wav (sr={})", sr);
+    assert!(
+        !phrases.is_empty() || remaining.is_some(),
+        "expected at least 1 phrase OR pending fragment from english_test.wav (sr={})",
+        sr
+    );
 }
 
 #[test]
@@ -167,7 +181,7 @@ fn test_vad_reset_clears_state() {
     let _ = vad.detect_phrase(&samples);
     vad.reset();
 
-    assert_eq!(vad.in_speech, false);
+    assert!(!vad.in_speech);
     assert_eq!(vad.silent_windows, 0);
     assert_eq!(vad.phrase_start, 0);
     assert_eq!(vad.processed_pos, 0);
@@ -191,7 +205,11 @@ fn test_vad_has_voice_content_real_speech_returns_true() {
     let (samples, sr) = load_wav("russian_speech_10s.wav");
     let vad = VadPhraseDetector::new(sr);
     let (has_voice, ratio) = vad.has_voice_content(&samples);
-    assert!(has_voice, "real speech should be classified as voice (ratio={})", ratio);
+    assert!(
+        has_voice,
+        "real speech should be classified as voice (ratio={})",
+        ratio
+    );
     assert!(ratio >= MIN_VOICE_RATIO_FOR_SPEECH);
 }
 

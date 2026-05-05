@@ -37,8 +37,7 @@ pub struct VadPhraseDetector {
 
 impl VadPhraseDetector {
     pub fn new(sample_rate: u32) -> Self {
-        let window_samples =
-            (VAD_WINDOW_MS as f32 * sample_rate as f32 / 1000.0) as usize;
+        let window_samples = (VAD_WINDOW_MS as f32 * sample_rate as f32 / 1000.0) as usize;
         let silence_windows_threshold = (VAD_SILENCE_MS / VAD_WINDOW_MS) as usize;
         let min_speech_windows = (VAD_MIN_SPEECH_MS / VAD_WINDOW_MS) as usize;
 
@@ -188,9 +187,10 @@ impl VadPhraseDetector {
                             let combined_len = end_pos.saturating_sub(start_pos);
                             let combined_duration_ms =
                                 combined_len as f32 / self.sample_rate as f32 * 1000.0;
-                            let min_fragment_samples =
-                                (MIN_FRAGMENT_DURATION_MS as f32 * self.sample_rate as f32
-                                    / 1000.0) as usize;
+                            let min_fragment_samples = (MIN_FRAGMENT_DURATION_MS as f32
+                                * self.sample_rate as f32
+                                / 1000.0)
+                                as usize;
 
                             // Check if combined fragment is long enough to send
                             if combined_len >= min_fragment_samples {

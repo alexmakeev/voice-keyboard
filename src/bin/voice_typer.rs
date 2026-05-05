@@ -43,9 +43,9 @@ use rdev::listen;
 use rdev::{Event, EventType, Key};
 use reqwest::blocking::Client;
 use std::process::Command;
-use voice_keyboard::vad::{VadPhraseDetector, MIN_VOICE_RATIO_FOR_SPEECH};
 #[cfg(feature = "whisper")]
 use voice_keyboard::vad::VAD_SILENCE_MS;
+use voice_keyboard::vad::{VadPhraseDetector, MIN_VOICE_RATIO_FOR_SPEECH};
 
 // ============================================================================
 // GUI Launch (feature-gated)
