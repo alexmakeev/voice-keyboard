@@ -5,6 +5,7 @@
 #[cfg(feature = "whisper")]
 mod tests {
     use std::path::PathBuf;
+    use voice_keyboard::vad::VadPhraseDetector;
     use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
     fn get_model_path() -> PathBuf {
@@ -332,109 +333,6 @@ mod tests {
         println!("Russian 30s test passed!");
     }
 
-    /// VAD phrase detector for testing (same as vad_test.rs)
-    struct VadPhraseDetector {
-        window_samples: usize,
-        silence_windows_threshold: usize,
-        min_speech_windows: usize,
-        silent_windows: usize,
-        in_speech: bool,
-        phrase_start: usize,
-        processed_pos: usize,
-    }
-
-    const SAMPLE_RATE: u32 = 16000;
-    const VAD_ENERGY_THRESHOLD: f32 = 0.01;
-    const VAD_SILENCE_MS: u64 = 300;
-    const VAD_MIN_SPEECH_MS: u64 = 200;
-    const VAD_WINDOW_MS: u64 = 20;
-
-    impl VadPhraseDetector {
-        fn new() -> Self {
-            let window_samples = (VAD_WINDOW_MS as f32 * SAMPLE_RATE as f32 / 1000.0) as usize;
-            let silence_windows_threshold = (VAD_SILENCE_MS / VAD_WINDOW_MS) as usize;
-            let min_speech_windows = (VAD_MIN_SPEECH_MS / VAD_WINDOW_MS) as usize;
-
-            Self {
-                window_samples,
-                silence_windows_threshold,
-                min_speech_windows,
-                silent_windows: 0,
-                in_speech: false,
-                phrase_start: 0,
-                processed_pos: 0,
-            }
-        }
-
-        fn calculate_energy(&self, samples: &[f32]) -> f32 {
-            if samples.is_empty() {
-                return 0.0;
-            }
-            let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
-            (sum_sq / samples.len() as f32).sqrt()
-        }
-
-        fn detect_phrase(&mut self, all_samples: &[f32]) -> Option<Vec<f32>> {
-            while self.processed_pos + self.window_samples <= all_samples.len() {
-                let window_start = self.processed_pos;
-                let window_end = window_start + self.window_samples;
-                let window = &all_samples[window_start..window_end];
-
-                let energy = self.calculate_energy(window);
-                let is_speech = energy >= VAD_ENERGY_THRESHOLD;
-
-                if is_speech {
-                    if !self.in_speech {
-                        self.in_speech = true;
-                        self.phrase_start = window_start;
-                    }
-                    self.silent_windows = 0;
-                } else if self.in_speech {
-                    self.silent_windows += 1;
-
-                    if self.silent_windows >= self.silence_windows_threshold {
-                        let phrase_end =
-                            window_start - (self.silent_windows - 1) * self.window_samples;
-                        let phrase_len = phrase_end.saturating_sub(self.phrase_start);
-
-                        if phrase_len >= self.min_speech_windows * self.window_samples {
-                            let phrase = all_samples[self.phrase_start..phrase_end].to_vec();
-                            self.in_speech = false;
-                            self.silent_windows = 0;
-                            self.phrase_start = window_end;
-                            self.processed_pos = window_end;
-                            return Some(phrase);
-                        } else {
-                            self.in_speech = false;
-                            self.silent_windows = 0;
-                            self.phrase_start = window_end;
-                        }
-                    }
-                }
-
-                self.processed_pos = window_end;
-            }
-
-            None
-        }
-
-        fn get_remaining(&self, all_samples: &[f32]) -> Option<Vec<f32>> {
-            if self.in_speech && all_samples.len() > self.phrase_start {
-                let phrase_len = all_samples.len() - self.phrase_start;
-                if phrase_len >= self.min_speech_windows * self.window_samples {
-                    return Some(all_samples[self.phrase_start..].to_vec());
-                }
-            }
-            if !self.in_speech && self.processed_pos < all_samples.len() {
-                let remaining_len = all_samples.len() - self.processed_pos;
-                if remaining_len >= self.min_speech_windows * self.window_samples {
-                    return Some(all_samples[self.processed_pos..].to_vec());
-                }
-            }
-            None
-        }
-    }
-
     #[test]
     fn test_russian_vad_phrase_detection() {
         let model_path = get_model_path();
@@ -467,18 +365,14 @@ mod tests {
         );
 
         // Use VAD to detect phrases
-        let mut vad = VadPhraseDetector::new();
+        let mut vad = VadPhraseDetector::new(16000);
         let mut phrases = Vec::new();
 
-        loop {
-            match vad.detect_phrase(&samples) {
-                Some(phrase) => phrases.push(phrase),
-                None => break,
-            }
+        while let Some((phrase, _, _)) = vad.detect_phrase(&samples) {
+            phrases.push(phrase);
         }
-
-        if let Some(remaining) = vad.get_remaining(&samples) {
-            phrases.push(remaining);
+        if let Some((rem, _, _)) = vad.get_remaining(&samples) {
+            phrases.push(rem);
         }
 
         println!("VAD detected {} phrases", phrases.len());
@@ -486,7 +380,7 @@ mod tests {
         // Transcribe each phrase
         let mut full_text = String::new();
         for (i, phrase) in phrases.iter().enumerate() {
-            let duration = phrase.len() as f32 / SAMPLE_RATE as f32;
+            let duration = phrase.len() as f32 / 16000.0;
             println!(
                 "Phrase {}: {:.1}s ({} samples)",
                 i + 1,
@@ -550,18 +444,15 @@ mod tests {
         );
 
         // Use VAD to detect phrases
-        let mut vad = VadPhraseDetector::new();
+        let mut vad = VadPhraseDetector::new(16000);
         let mut phrases = Vec::new();
 
         let vad_start = std::time::Instant::now();
-        loop {
-            match vad.detect_phrase(&samples) {
-                Some(phrase) => phrases.push(phrase),
-                None => break,
-            }
+        while let Some((phrase, _, _)) = vad.detect_phrase(&samples) {
+            phrases.push(phrase);
         }
-        if let Some(remaining) = vad.get_remaining(&samples) {
-            phrases.push(remaining);
+        if let Some((rem, _, _)) = vad.get_remaining(&samples) {
+            phrases.push(rem);
         }
         let total_vad_time = vad_start.elapsed();
 
@@ -576,7 +467,7 @@ mod tests {
         let mut total_transcribe_time = std::time::Duration::ZERO;
 
         for (i, phrase) in phrases.iter().enumerate() {
-            let duration = phrase.len() as f32 / SAMPLE_RATE as f32;
+            let duration = phrase.len() as f32 / 16000.0;
 
             let start = std::time::Instant::now();
             let text = transcribe_russian(&ctx, phrase);
