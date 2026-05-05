@@ -845,6 +845,7 @@ const OPENROUTER_SUPPORTED_MODELS: &[&str] =
 #[derive(Clone)]
 struct OpenRouterConfig {
     api_key: String,
+    api_url: String,
     model: String,
     transcription_prompt: String,
 }
@@ -918,10 +919,18 @@ impl OpenRouterConfig {
 
         println!("[CONFIG] OpenRouter model: {}", model);
 
+        let api_url = env::var("OPENROUTER_API_URL")
+            .ok()
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| "https://openrouter.ai/api/v1/chat/completions".to_string());
+
+        println!("[CONFIG] OpenRouter API URL: {}", api_url);
+
         let transcription_prompt = get_openai_prompt();
 
         Some(Self {
             api_key,
+            api_url,
             model,
             transcription_prompt,
         })
@@ -973,7 +982,7 @@ fn transcribe_openrouter_single_attempt(
         .map_err(|e| format!("Failed to serialize OpenRouter request: {}", e))?;
 
     let client = Client::new();
-    let url = "https://openrouter.ai/api/v1/chat/completions";
+    let url = &config.api_url;
 
     println!(
         "[{}] Sending to OpenRouter: model={}, audio={:.0} KB",

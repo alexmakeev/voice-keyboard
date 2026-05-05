@@ -112,6 +112,8 @@ pub struct AppConfig {
     pub input_method: String,
     pub openai_api_key: String,
     pub openai_api_url: String,
+    #[serde(default)]
+    pub openrouter_api_url: String,
     pub transcription_mode: String,
     #[serde(default = "default_true")]
     pub sound_enabled: bool,
@@ -148,6 +150,7 @@ impl Default for AppConfig {
             input_method: "keyboard".to_string(),
             openai_api_key: String::new(),
             openai_api_url: "https://api.openai.com/v1".to_string(),
+            openrouter_api_url: String::new(),
             transcription_mode: "openai".to_string(),
             sound_enabled: true,
             audio_device: String::new(),
@@ -1568,6 +1571,9 @@ fn spawn_voice_typer(config: &AppConfig) -> Result<Child, String> {
     }
     if !config.openai_api_url.trim().is_empty() {
         cmd.env("OPENAI_API_URL", config.openai_api_url.trim());
+    }
+    if !config.openrouter_api_url.trim().is_empty() {
+        cmd.env("OPENROUTER_API_URL", config.openrouter_api_url.trim());
     }
 
     // Preprompts (passed as env vars to support multi-line values)

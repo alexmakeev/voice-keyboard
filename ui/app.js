@@ -36,6 +36,7 @@ let config = {
     input_method: 'keyboard',
     openai_api_key: '',
     openai_api_url: 'https://api.openai.com/v1',
+    openrouter_api_url: '',
     transcription_mode: 'openai',
     sound_enabled: true,
     audio_device: '',
@@ -125,6 +126,7 @@ function cacheElements() {
         inputMethodSelect: document.getElementById('input-method-select'),
         openaiKeyInput: document.getElementById('openai-key'),
         openaiUrlInput: document.getElementById('openai-url'),
+        openrouterUrlInput: document.getElementById('openrouter-url'),
         soundEnabled: document.getElementById('sound-enabled'),
         audioDeviceSelect: document.getElementById('audio-device-select'),
         lowerVolume: document.getElementById('lower-volume'),
@@ -257,6 +259,10 @@ function setupEventListeners() {
 
     elements.openaiUrlInput.addEventListener('input', (e) => {
         config.openai_api_url = e.target.value;
+    });
+
+    elements.openrouterUrlInput.addEventListener('input', (e) => {
+        config.openrouter_api_url = e.target.value;
     });
 
     elements.soundEnabled.addEventListener('change', (e) => {
@@ -465,6 +471,7 @@ async function loadConfig() {
     elements.inputMethodSelect.value = config.input_method;
     elements.openaiKeyInput.value = config.openai_api_key || '';
     elements.openaiUrlInput.value = config.openai_api_url || '';
+    elements.openrouterUrlInput.value = config.openrouter_api_url || '';
     updateApiKeyHint();
     elements.soundEnabled.checked = config.sound_enabled !== false;
     await loadAudioDevices();
@@ -682,6 +689,7 @@ async function saveSettings() {
         config.input_method = elements.inputMethodSelect.value;
         config.openai_api_key = elements.openaiKeyInput.value.trim();
         config.openai_api_url = elements.openaiUrlInput.value.trim();
+        config.openrouter_api_url = elements.openrouterUrlInput.value.trim();
         config.sound_enabled = elements.soundEnabled.checked;
         config.audio_device = elements.audioDeviceSelect.value;
         config.lower_volume_on_record = elements.lowerVolume.checked;
