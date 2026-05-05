@@ -278,6 +278,14 @@ function setupEventListeners() {
         e.target.value = val;
         config.min_recording_ms = val;
     });
+
+    document.getElementById('update-install-btn')?.addEventListener('click', installUpdate);
+    document.getElementById('update-later-btn')?.addEventListener('click', dismissUpdateOverlay);
+    document.getElementById('check-update-btn')?.addEventListener('click', checkForUpdate);
+    document.getElementById('github-link')?.addEventListener('click', (e) => {
+        e.preventDefault();
+        openGitHub();
+    });
 }
 
 function setupDebugFilters() {
@@ -754,7 +762,7 @@ function updateStatus(status, text) {
         case 'error':
             state.classList.add('idle');
             icon.textContent = '❌';
-            label.innerHTML = text || 'Error';
+            label.textContent = text || 'Error';
             break;
         default:
             if (doneTimeout) { clearTimeout(doneTimeout); doneTimeout = null; }
@@ -852,9 +860,9 @@ function updateApiKeyHint() {
     if (hint) {
         if (key.length > 4) {
             hint.textContent = 'Key: ••••' + key.slice(-2);
-            hint.style.display = '';
+            hint.classList.remove('hidden');
         } else {
-            hint.style.display = 'none';
+            hint.classList.add('hidden');
         }
     }
 }
@@ -1019,11 +1027,9 @@ function showMicDeniedBanner() {
     if (!banner) {
         banner = document.createElement('div');
         banner.id = 'mic-denied-banner';
-        banner.style.cssText = 'background:#c0392b;color:#fff;padding:10px 16px;text-align:center;font-size:13px;';
-        banner.innerHTML = 'Voice Keyboard needs microphone access. Enable microphone access in your system privacy settings and make sure an input device is available. ';
+        banner.textContent = 'Voice Keyboard needs microphone access. Enable microphone access in your system privacy settings and make sure an input device is available. ';
         const button = document.createElement('button');
         button.textContent = 'Open Settings';
-        button.style.cssText = 'margin-left:8px;padding:2px 8px;cursor:pointer;';
         button.addEventListener('click', async () => {
             try {
                 await invoke('open_privacy_settings');
@@ -1110,7 +1116,7 @@ function showUpdateOverlay(updateInfo) {
     const laterBtn = document.getElementById('update-later-btn');
 
     if (progressArea) {
-        progressArea.style.display = 'none';
+        progressArea.classList.add('hidden');
     }
     if (progressText) {
         progressText.textContent = 'Downloading...';
@@ -1144,13 +1150,13 @@ function showUpdateOverlay(updateInfo) {
     _updateState.checksumsUrl = info.checksums_url || null;
     _updateState.assetFilename = info.asset_filename || null;
 
-    overlay.style.display = 'flex';
+    overlay.classList.remove('hidden');
 }
 
 function dismissUpdateOverlay() {
     const overlay = document.getElementById('update-overlay');
     if (overlay) {
-        overlay.style.display = 'none';
+        overlay.classList.add('hidden');
     }
 }
 
@@ -1167,7 +1173,7 @@ async function installUpdate() {
                 progressText.textContent = 'Please download the update manually from the release page.';
             }
             if (progressArea) {
-                progressArea.style.display = '';
+                progressArea.classList.remove('hidden');
             }
             if (btn) {
                 btn.textContent = 'Open Release Page';
@@ -1186,7 +1192,7 @@ async function installUpdate() {
                 progressText.textContent = 'Error: No download URL available';
             }
             if (progressArea) {
-                progressArea.style.display = '';
+                progressArea.classList.remove('hidden');
             }
             if (btn) {
                 btn.disabled = false;
@@ -1206,7 +1212,7 @@ async function installUpdate() {
     }
 
     if (progressArea) {
-        progressArea.style.display = '';
+        progressArea.classList.remove('hidden');
     }
 
     if (progressText) {

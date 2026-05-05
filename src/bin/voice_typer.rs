@@ -235,7 +235,7 @@ enum RecordingState {
 struct SendCallback<F>(F);
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-unsafe impl<F> Send for SendCallback<F> {}
+unsafe impl<F: FnOnce()> Send for SendCallback<F> {}
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 impl<F: FnOnce()> SendCallback<F> {

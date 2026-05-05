@@ -1371,3 +1371,18 @@ h1, h2, h3, h4, h5, h6,
     transform: scale(0.97);
     animation: pulse-bg 1.5s infinite;
 }
+
+/* Microphone permission denied banner (was inline style.cssText in app.js) */
+#mic-denied-banner {
+    background: #c0392b;
+    color: #fff;
+    padding: 10px 16px;
+    text-align: center;
+    font-size: 13px;
+}
+
+#mic-denied-banner button {
+    margin-left: 8px;
+    padding: 2px 8px;
+    cursor: pointer;
+}
