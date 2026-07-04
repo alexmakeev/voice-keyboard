@@ -37,3 +37,7 @@ src-tauri/gen/
 # Dev reports (audio + transcriptions for analysis)
 reports/
 # Build: 2025-12-16 15:03:28
+
+# Apple signing certificates (never commit)
+*.p8
+*.p12
