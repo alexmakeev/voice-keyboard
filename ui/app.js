@@ -9,6 +9,12 @@ let debugLines = [];
 const MAX_DEBUG_LINES = 2000;
 let statusPollTimer = null;
 let lastPollStatus = null;
+let permissionsPollTimer = null;
+// Tracks whether the previous checkPermissions() tick saw every required
+// permission granted, so we can detect the false→true transition (see
+// checkPermissions below) and restart the sidecar immediately instead of
+// waiting for its own internal grab() retry loop's next tick.
+let lastAllPermissionsGranted = false;
 let lastPollTranscriptionCount = 0;
 let lastPollDebugCount = 0;
 let doneTimeout = null;
@@ -96,6 +102,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     renderModels();
     renderLanguages();
     startStatusPolling();
+    startPermissionsPolling();
     checkApiKeyRequired();
 });
 
@@ -141,7 +148,8 @@ function cacheElements() {
         checkUpdateBtn: document.getElementById('check-update-btn'),
         // Permissions modal
         permissionsModal: document.getElementById('permissions-modal'),
-        openSettingsBtn: document.getElementById('open-settings-btn'),
+        openMicrophoneBtn: document.getElementById('open-microphone-settings-btn'),
+        openAccessibilityBtn: document.getElementById('open-accessibility-settings-btn'),
         checkAgainBtn: document.getElementById('check-again-btn'),
         // Report modal
         reportModal: document.getElementById('report-modal'),
@@ -995,7 +1003,15 @@ async function checkPermissions() {
 
         updatePermissionItem('perm-microphone', perms.microphone);
         updatePermissionItem('perm-accessibility', perms.accessibility);
-        updatePermissionItem('perm-input_monitoring', perms.input_monitoring);
+
+        // Each row's "Open Settings" deep-link is only useful while that
+        // specific permission is still missing — hide it once granted.
+        if (elements.openMicrophoneBtn) {
+            elements.openMicrophoneBtn.classList.toggle('hidden', !!perms.microphone);
+        }
+        if (elements.openAccessibilityBtn) {
+            elements.openAccessibilityBtn.classList.toggle('hidden', !!perms.accessibility);
+        }
 
         const micBlocked = perms.microphone_status === 'denied' || perms.microphone_status === 'restricted';
         if (micBlocked) {
@@ -1004,11 +1020,34 @@ async function checkPermissions() {
             hideMicDeniedBanner();
         }
 
-        if (perms.microphone && perms.accessibility && perms.input_monitoring) {
+        const allGranted = !!(perms.microphone && perms.accessibility);
+        if (allGranted) {
             elements.permissionsModal.classList.add('hidden');
         } else {
             elements.permissionsModal.classList.remove('hidden');
         }
+
+        // Snappier UX than waiting for the sidecar's own internal grab() retry
+        // loop: the moment permissions transition from "not all granted" to
+        // "all granted" (e.g. the user just approved Input Monitoring in System
+        // Settings), restart the sidecar right away so the hotkey listener picks
+        // up a fresh grab() attempt immediately instead of on its next backoff
+        // tick. Only fires on the false→true transition — not on every poll —
+        // so an already-working hotkey listener isn't needlessly bounced.
+        if (allGranted && !lastAllPermissionsGranted) {
+            // Flip the flag before restarting so the recursive checkPermissions()
+            // call below (and any concurrent poll tick) doesn't see false→true
+            // again and trigger a duplicate restart.
+            lastAllPermissionsGranted = true;
+            try {
+                await invoke('restart_voice_typer');
+            } catch (e) {
+                console.error('Failed to restart voice-typer after permissions granted:', e);
+            }
+            await checkPermissions();
+            return;
+        }
+        lastAllPermissionsGranted = allGranted;
     } catch (e) {
         console.error('Failed to check permissions:', e);
     }
@@ -1058,17 +1097,36 @@ function updatePermissionItem(elementId, granted) {
 }
 
 function setupPermissionsListeners() {
-    elements.openSettingsBtn.addEventListener('click', async () => {
+    // Microphone and Input Monitoring both trigger the real sidecar
+    // permission-request preflight ("Grant") rather than just deep-linking to
+    // System Settings: Microphone can show a genuine native OS dialog on
+    // first request, and even though Input Monitoring's dialog is unreliable
+    // from the sidecar's headless subprocess, requesting it is still the
+    // more correct primary action than jumping straight to Settings.
+    // Re-requesting an already-granted permission is a harmless no-op, so
+    // reusing the same full preflight for both rows is safe.
+    elements.openMicrophoneBtn.addEventListener('click', async () => {
+        elements.openMicrophoneBtn.disabled = true;
         try {
-            await invoke('open_privacy_settings');
+            await invoke('request_permissions');
         } catch (e) {
-            console.error('Failed to open settings:', e);
+            console.error('Failed to request Microphone permission:', e);
+        }
+        await checkPermissions();
+        elements.openMicrophoneBtn.disabled = false;
+    });
+
+    elements.openAccessibilityBtn.addEventListener('click', async () => {
+        try {
+            await invoke('open_accessibility_settings');
+        } catch (e) {
+            console.error('Failed to open Accessibility settings:', e);
         }
     });
 
     elements.checkAgainBtn.addEventListener('click', async () => {
         elements.checkAgainBtn.disabled = true;
-        elements.checkAgainBtn.textContent = 'Reloading...';
+        elements.checkAgainBtn.textContent = 'Restarting...';
         try {
             await invoke('restart_voice_typer');
         } catch (e) {
@@ -1078,6 +1136,19 @@ function setupPermissionsListeners() {
         elements.checkAgainBtn.disabled = false;
         elements.checkAgainBtn.textContent = 'Reload and Check';
     });
+}
+
+/// Poll permission status every 2s so checkmarks/banner reflect grants made
+/// in System Settings live, without requiring the user to manually restart
+/// anything. Cheap enough to run for the app's whole lifetime: each tick is
+/// just two fast local TCC status reads (wrapper) plus one short-lived
+/// `voice-typer --check-permissions` subprocess call (sidecar), no dialogs,
+/// no audio/input side effects.
+function startPermissionsPolling() {
+    if (permissionsPollTimer) return;
+    permissionsPollTimer = setInterval(() => {
+        checkPermissions();
+    }, 2000);
 }
 
 // ============================================================================

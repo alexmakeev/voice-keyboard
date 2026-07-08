@@ -282,28 +282,22 @@
             <div class="permissions-list">
                 <div class="permission-item" id="perm-microphone">
                     <span class="perm-icon">&#x274C;</span>
-                    <div>
+                    <div class="perm-text">
                         <div class="perm-name">Microphone</div>
                         <div class="perm-desc">Record speech for transcription</div>
                     </div>
+                    <button id="open-microphone-settings-btn" type="button" class="btn btn-secondary btn-open-settings hidden">Grant</button>
                 </div>
                 <div class="permission-item" id="perm-accessibility">
                     <span class="perm-icon">&#x274C;</span>
-                    <div>
+                    <div class="perm-text">
                         <div class="perm-name">Accessibility</div>
                         <div class="perm-desc">Type transcribed text into apps</div>
                     </div>
-                </div>
-                <div class="permission-item" id="perm-input_monitoring">
-                    <span class="perm-icon">&#x274C;</span>
-                    <div>
-                        <div class="perm-name">Input Monitoring</div>
-                        <div class="perm-desc">Detect hotkey press to start recording</div>
-                    </div>
+                    <button id="open-accessibility-settings-btn" type="button" class="btn btn-secondary btn-open-settings hidden">Open Settings</button>
                 </div>
             </div>
-            <div class="modal-actions">
-                <button id="open-settings-btn" type="button" class="btn btn-secondary">Open System Settings</button>
+            <div class="modal-actions single-action">
                 <button id="check-again-btn" type="button" class="btn btn-primary">Reload and Check</button>
             </div>
         </div>

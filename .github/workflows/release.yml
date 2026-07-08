@@ -207,13 +207,27 @@ jobs:
         run: |
           KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
           security create-keychain -p "" $KEYCHAIN_PATH
+          # Disable auto-lock: the default 5-minute keychain timeout can expire
+          # mid-build (cargo tauri build compiles Rust + bundles the app), and a
+          # headless CI session cannot answer the resulting re-unlock prompt --
+          # codesign then hangs indefinitely instead of failing. 21600s = 6h
+          # matches the GitHub Actions job time limit.
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
           security default-keychain -s $KEYCHAIN_PATH
           security unlock-keychain -p "" $KEYCHAIN_PATH
           echo "$APPLE_CERTIFICATE" | base64 --decode > $RUNNER_TEMP/certificate.p12
           security import $RUNNER_TEMP/certificate.p12 -k $KEYCHAIN_PATH \
             -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "" $KEYCHAIN_PATH
+          # Ensure codesign can actually locate the identity at sign-time: setting
+          # the default keychain does not add it to the search list that
+          # codesign/productbuild query.
+          security list-keychains -d user -s $KEYCHAIN_PATH
 
+      # Notarization uses the App Store Connect API key method (APPLE_API_KEY /
+      # APPLE_API_KEY_ID / APPLE_API_ISSUER below). The APPLE_TEAM_ID secret
+      # configured on this repo is unused by this workflow -- it belongs to the
+      # older Apple-ID + app-specific-password notarization method, not this one.
       - name: Prepare API key for notarization
         env:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
@@ -240,10 +254,64 @@ jobs:
 
       - name: Package DMG from signed app
         run: |
+          set -euo pipefail
           APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Voice Keyboard.app"
+          VOLNAME="Voice Keyboard"
+          STAGING="$RUNNER_TEMP/dmg-staging"
+          RW_DMG="$RUNNER_TEMP/voice-keyboard-rw.dmg"
+          FINAL_DMG="dist/voice-keyboard-macos-${{ matrix.arch }}.dmg"
+
           mkdir -p dist
-          hdiutil create -volname "Voice Keyboard" -srcfolder "${APP}" -ov -format UDZO \
-            "dist/voice-keyboard-macos-${{ matrix.arch }}.dmg"
+          rm -rf "$STAGING"
+          mkdir -p "$STAGING"
+
+          # Standard drag-to-install layout: app + Applications shortcut side by side
+          cp -R "$APP" "$STAGING/"
+          ln -s /Applications "$STAGING/Applications"
+
+          # Build a writable image sized to the staged contents, then lay out
+          # the Finder window/icons the same way Tauri's own dmg bundler does
+          # (see src-tauri/tauri.conf.json bundle.macOS.dmg for the matching values).
+          rm -f "$RW_DMG"
+          hdiutil create -volname "$VOLNAME" -srcfolder "$STAGING" -ov -format UDRW -fs HFS+ "$RW_DMG"
+
+          MOUNT_DIR=$(hdiutil attach -readwrite -noverify -noautoopen -plist "$RW_DMG" | python3 -c "
+          import plistlib, sys
+          d = plistlib.loads(sys.stdin.buffer.read())
+          for e in d['system-entities']:
+              if 'mount-point' in e:
+                  print(e['mount-point'])
+                  break
+          ")
+          MOUNTED_VOLNAME=$(basename "$MOUNT_DIR")
+
+          # Built as a quoted variable (not a heredoc): a heredoc's closing
+          # delimiter must start at column 0, which is less indented than this
+          # YAML block scalar's content -- that prematurely ends the `run: |`
+          # block and breaks parsing of the whole workflow file.
+          APPLESCRIPT='tell application "Finder"
+            tell disk "'"$MOUNTED_VOLNAME"'"
+              open
+              set current view of container window to icon view
+              set toolbar visible of container window to false
+              set statusbar visible of container window to false
+              set the bounds of container window to {100, 100, 760, 500}
+              set theViewOptions to the icon view options of container window
+              set arrangement of theViewOptions to not arranged
+              set icon size of theViewOptions to 128
+              set position of item "Voice Keyboard.app" of container window to {180, 170}
+              set position of item "Applications" of container window to {480, 170}
+              close
+              open
+              update without registering applications
+              delay 1
+            end tell
+          end tell'
+          osascript -e "$APPLESCRIPT"
+
+          hdiutil detach "$MOUNT_DIR"
+          hdiutil convert "$RW_DMG" -format UDZO -ov -o "$FINAL_DMG"
+          rm -f "$RW_DMG"
 
       - name: Notarize DMG
         env:
@@ -251,21 +319,50 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
           DMG="dist/voice-keyboard-macos-${{ matrix.arch }}.dmg"
+          API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
           for attempt in 1 2 3; do
             echo "Notarization attempt $attempt of 3..."
-            if xcrun notarytool submit "$DMG" \
-              --key $RUNNER_TEMP/AuthKey.p8 \
+            # --timeout caps how long --wait polls Apple's service: without it, a
+            # single slow/stuck submission can consume the entire 6h job budget,
+            # leaving the retry loop below no chance to ever retry.
+            # --output-format json gives a reliable submission id/status to parse
+            # (instead of scraping the human-readable "normal" output), so we can
+            # fetch the detailed rejection log below on failure.
+            set +e
+            SUBMIT_OUTPUT=$(xcrun notarytool submit "$DMG" \
+              --key "$API_KEY_PATH" \
               --key-id "$APPLE_API_KEY_ID" \
               --issuer "$APPLE_API_ISSUER" \
-              --wait; then
+              --wait \
+              --timeout 15m \
+              --output-format json)
+            SUBMIT_EXIT=$?
+            set -e
+            echo "$SUBMIT_OUTPUT"
+            SUBMISSION_ID=$(echo "$SUBMIT_OUTPUT" | jq -r '.id // empty' 2>/dev/null)
+            SUBMIT_STATUS=$(echo "$SUBMIT_OUTPUT" | jq -r '.status // empty' 2>/dev/null)
+
+            if [ "$SUBMIT_EXIT" -eq 0 ] && [ "$SUBMIT_STATUS" = "Accepted" ]; then
               echo "Notarization succeeded on attempt $attempt"
               break
             fi
+
+            echo "Notarization attempt $attempt failed (exit=$SUBMIT_EXIT, status=${SUBMIT_STATUS:-unknown})"
+            if [ -n "$SUBMISSION_ID" ]; then
+              echo "Fetching Apple's notarization log for submission $SUBMISSION_ID..."
+              xcrun notarytool log "$SUBMISSION_ID" \
+                --key "$API_KEY_PATH" \
+                --key-id "$APPLE_API_KEY_ID" \
+                --issuer "$APPLE_API_ISSUER" || echo "Could not fetch notarization log"
+            else
+              echo "No submission id available (submission likely never reached Apple's service)"
+            fi
+
             if [ $attempt -eq 3 ]; then
               echo "Notarization failed after 3 attempts"
               exit 1
             fi
-            echo "Attempt $attempt failed, retrying in 30 seconds..."
+            echo "Retrying in 30 seconds..."
             sleep 30
           done
           xcrun stapler staple "$DMG"

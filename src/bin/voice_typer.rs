@@ -307,66 +307,123 @@ fn start_hotkey_listener(
         thread::spawn(move || send_worker.run());
 
         let max_recording = max_recording_duration();
-        let grab_fn = move |event: Event| -> Option<Event> {
-            // Recording timeout: force-stop if recording has been active too long.
-            // This check runs on every key event, so ANY keyboard activity triggers recovery.
-            {
-                let rec_state = state_for_grab.lock().unwrap();
-                if *rec_state == RecordingState::Recording {
-                    let timed_out = recording_start_for_grab
-                        .lock()
-                        .unwrap()
-                        .map(|start| start.elapsed() > max_recording)
-                        .unwrap_or(false);
-                    if timed_out {
-                        drop(rec_state);
-                        eprintln!(
-                            "[{}] WARNING: Recording timeout ({}s) — force-stopping stuck recording",
-                            timestamp(),
-                            max_recording.as_secs()
-                        );
-                        is_recording_for_grab.store(false, std::sync::atomic::Ordering::SeqCst);
-                        let mut rec_state = state_for_grab.lock().unwrap();
-                        *rec_state = RecordingState::Idle;
-                        *recording_start_for_grab.lock().unwrap() = None;
-                        drop(rec_state);
 
-                        // Pause audio stream
-                        {
-                            let stream_guard = persistent_stream_for_grab.lock().unwrap();
-                            if let Some(ref stream) = *stream_guard {
-                                let _ = stream.pause();
+        // `rdev::grab` fails immediately (`GrabError::EventTapError`, from a null
+        // `CGEventTapCreate`) when macOS Accessibility hasn't been granted yet —
+        // rdev's macOS backend offers no way to distinguish "permission denied" from
+        // any other tap-creation failure, so every grab() error is treated as a
+        // possibly-still-unpermitted retry candidate (the overwhelmingly realistic
+        // cause in this app). Without retrying here, a user who launches the app
+        // before granting Accessibility gets a permanently dead hotkey for the
+        // rest of the sidecar process's life, recoverable only via a full restart.
+        //
+        // Retry on a fixed interval until grab() succeeds — after which it blocks
+        // forever inside rdev's CFRunLoopRun and this function does not return in
+        // practice — or a generous attempt cap is hit, at which point we give up
+        // and tell the user to restart. Logging is throttled to the first failure
+        // and then every Nth attempt so a multi-minute wait doesn't spam the log
+        // with an identical message every few seconds. This call runs on the main
+        // thread (the last statement of voice-typer's run_* functions, invoked
+        // directly from `main()`), so blocking here in a retry loop does not
+        // starve any other sidecar functionality — audio recording, stdin command
+        // handling, etc. all run on threads already spawned earlier.
+        const GRAB_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+        const GRAB_MAX_ATTEMPTS: u32 = 200; // ~10 minutes at 3s intervals
+        const GRAB_LOG_EVERY: u32 = 10;
+
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+
+            let state_for_grab = Arc::clone(&state_for_grab);
+            let recording_start_for_grab = Arc::clone(&recording_start_for_grab);
+            let is_recording_for_grab = Arc::clone(&is_recording_for_grab);
+            let persistent_stream_for_grab = Arc::clone(&persistent_stream_for_grab);
+            let volume_controller_for_grab = Arc::clone(&volume_controller_for_grab);
+            let event_tx = event_tx.clone();
+
+            let grab_fn = move |event: Event| -> Option<Event> {
+                // Recording timeout: force-stop if recording has been active too long.
+                // This check runs on every key event, so ANY keyboard activity triggers recovery.
+                {
+                    let rec_state = state_for_grab.lock().unwrap();
+                    if *rec_state == RecordingState::Recording {
+                        let timed_out = recording_start_for_grab
+                            .lock()
+                            .unwrap()
+                            .map(|start| start.elapsed() > max_recording)
+                            .unwrap_or(false);
+                        if timed_out {
+                            drop(rec_state);
+                            eprintln!(
+                                "[{}] WARNING: Recording timeout ({}s) — force-stopping stuck recording",
+                                timestamp(),
+                                max_recording.as_secs()
+                            );
+                            is_recording_for_grab.store(false, std::sync::atomic::Ordering::SeqCst);
+                            let mut rec_state = state_for_grab.lock().unwrap();
+                            *rec_state = RecordingState::Idle;
+                            *recording_start_for_grab.lock().unwrap() = None;
+                            drop(rec_state);
+
+                            // Pause audio stream
+                            {
+                                let stream_guard = persistent_stream_for_grab.lock().unwrap();
+                                if let Some(ref stream) = *stream_guard {
+                                    let _ = stream.pause();
+                                }
                             }
+
+                            // Restore system volume
+                            volume_controller_for_grab.restore();
+
+                            // Still forward the event to the worker thread
+                            let _ = event_tx.send(event.clone());
+                            return Some(event);
                         }
-
-                        // Restore system volume
-                        volume_controller_for_grab.restore();
-
-                        // Still forward the event to the worker thread
-                        let _ = event_tx.send(event.clone());
-                        return Some(event);
                     }
                 }
-            }
 
-            let suppress = matches!(
-                event.event_type,
-                EventType::KeyPress(Key::Num1 | Key::Num2 | Key::Num3)
-                    | EventType::KeyRelease(Key::Num1 | Key::Num2 | Key::Num3)
-            ) && *state_for_grab.lock().unwrap() == RecordingState::Recording;
+                let suppress = matches!(
+                    event.event_type,
+                    EventType::KeyPress(Key::Num1 | Key::Num2 | Key::Num3)
+                        | EventType::KeyRelease(Key::Num1 | Key::Num2 | Key::Num3)
+                ) && *state_for_grab.lock().unwrap() == RecordingState::Recording;
 
-            // Send event to worker thread for processing (non-blocking)
-            let _ = event_tx.send(event.clone());
-            if suppress {
-                None
-            } else {
-                Some(event)
+                // Send event to worker thread for processing (non-blocking)
+                let _ = event_tx.send(event.clone());
+                if suppress {
+                    None
+                } else {
+                    Some(event)
+                }
+            };
+
+            match grab(grab_fn) {
+                Ok(()) => break,
+                Err(e) => {
+                    if attempt == 1 || attempt % GRAB_LOG_EVERY == 0 {
+                        eprintln!("[{}] Error: {:?}", timestamp(), e);
+                        eprintln!("\nGrant Accessibility permission:");
+                        eprintln!("System Settings → Privacy & Security → Accessibility");
+                        eprintln!(
+                            "[{}] Hotkey listener will keep retrying automatically (attempt {}/{}) once permission is granted — no restart needed.",
+                            timestamp(),
+                            attempt,
+                            GRAB_MAX_ATTEMPTS
+                        );
+                    }
+                    if attempt >= GRAB_MAX_ATTEMPTS {
+                        eprintln!(
+                            "[{}] Giving up on hotkey listener after {} attempts — please restart the app after granting Accessibility permission.",
+                            timestamp(),
+                            attempt
+                        );
+                        break;
+                    }
+                    thread::sleep(GRAB_RETRY_INTERVAL);
+                }
             }
-        };
-        if let Err(e) = grab(grab_fn) {
-            eprintln!("Error: {:?}", e);
-            eprintln!("\nGrant Input Monitoring permission:");
-            eprintln!("System Settings → Privacy & Security → Input Monitoring");
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -2210,6 +2267,189 @@ fn print_version() {
     println!("https://github.com/alexmak/voice-keyboard");
 }
 
+// ============================================================================
+// macOS TCC (permission) preflight for the voice-typer sidecar process
+//
+// The Tauri wrapper app and this voice-typer binary are two SEPARATE code
+// signatures on macOS (the wrapper re-signs this binary with its own
+// entitlements during the release build — see src-tauri/entitlements.plist
+// and .github/workflows/release.yml). Because this app is NOT sandboxed,
+// `com.apple.security.inherit` has no effect: macOS TCC treats this process
+// as its own distinct identity for Accessibility and Microphone grants.
+// Accessibility (enigo keyboard injection, and rdev::grab global hotkey
+// capture — CGEventTapCreate with a modify/suppress-capable tap is gated by
+// Accessibility alone, not Input Monitoring) is only ever exercised by THIS
+// process, never by the wrapper — so the wrapper's own permission dialogs
+// (requested for its own identity) never cover what this process actually
+// needs. `--request-permissions` lets the wrapper trigger this process's own
+// dialogs proactively, back-to-back with its own, instead of leaving them to
+// surprise the user on first hotkey/Record press.
+// ============================================================================
+
+#[cfg(target_os = "macos")]
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
+    static kAXTrustedCheckOptionPrompt: *const std::ffi::c_void;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    static kCFBooleanTrue: *const std::ffi::c_void;
+    static kCFTypeDictionaryKeyCallBacks: u8;
+    static kCFTypeDictionaryValueCallBacks: u8;
+    fn CFDictionaryCreate(
+        allocator: *const std::ffi::c_void,
+        keys: *const *const std::ffi::c_void,
+        values: *const *const std::ffi::c_void,
+        num_values: isize,
+        key_callbacks: *const std::ffi::c_void,
+        value_callbacks: *const std::ffi::c_void,
+    ) -> *const std::ffi::c_void;
+    fn CFRelease(cf: *const std::ffi::c_void);
+}
+
+// `AVMediaTypeAudio` NSString constant, needed to query this process's microphone
+// authorization status (see `mic_auth_status` below). Force-links AVFoundation so
+// the Objective-C class `AVCaptureDevice` is resolvable via the `objc` runtime at
+// call time (same raw msg_send! pattern already used for NSWorkspace elsewhere in
+// this file), without adding a new crate dependency.
+#[cfg(target_os = "macos")]
+#[link(name = "AVFoundation", kind = "framework")]
+extern "C" {
+    static AVMediaTypeAudio: *mut objc::runtime::Object;
+}
+
+/// Query this process's own current microphone authorization status via
+/// AVFoundation (`AVCaptureDevice.authorizationStatusForMediaType:`). Returns
+/// true only for `AVAuthorizationStatusAuthorized` (raw value 3); NotDetermined
+/// (0), Restricted (1) and Denied (2) all read as false.
+#[cfg(target_os = "macos")]
+fn mic_auth_status() -> bool {
+    use objc::runtime::Class;
+    use objc::{msg_send, sel, sel_impl};
+    unsafe {
+        let Some(cls) = Class::get("AVCaptureDevice") else {
+            return false;
+        };
+        let status: i64 = msg_send![cls, authorizationStatusForMediaType: AVMediaTypeAudio];
+        status == 3
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mic_auth_status() -> bool {
+    true
+}
+
+/// Poll an "is granted" predicate until it returns true or `timeout` elapses.
+/// Accessibility has no completion callback on macOS: the request call shows
+/// the dialog and returns immediately, before the user has responded, so
+/// polling the corresponding status check is how we detect the user's
+/// response (or give up after `timeout` if they ignore/deny it).
+#[cfg(target_os = "macos")]
+fn poll_until_granted<F: Fn() -> bool>(
+    is_granted: F,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if is_granted() {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
+/// `voice-typer --request-permissions`: request Accessibility and Microphone
+/// access for THIS process's own identity, sequentially, then exit. Intended
+/// to be run by the wrapper app as an extra step appended to its
+/// own startup permission chain, so all dialogs (wrapper's + sidecar's) appear
+/// back-to-back on first run instead of the sidecar's being deferred to first
+/// use (first hotkey press / first Record press).
+#[cfg(target_os = "macos")]
+fn cli_request_permissions() {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+    const POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+    // --- Accessibility (needed for enigo keyboard injection) ---
+    if unsafe { AXIsProcessTrusted() } {
+        println!("[PERMISSIONS] voice-typer Accessibility: already trusted");
+    } else {
+        unsafe {
+            let key = kAXTrustedCheckOptionPrompt;
+            let value = kCFBooleanTrue;
+            let options = CFDictionaryCreate(
+                std::ptr::null(),
+                &key as *const *const std::ffi::c_void,
+                &value as *const *const std::ffi::c_void,
+                1,
+                &kCFTypeDictionaryKeyCallBacks as *const u8 as *const std::ffi::c_void,
+                &kCFTypeDictionaryValueCallBacks as *const u8 as *const std::ffi::c_void,
+            );
+            AXIsProcessTrustedWithOptions(options);
+            if !options.is_null() {
+                CFRelease(options);
+            }
+        }
+        println!("[PERMISSIONS] voice-typer Accessibility: prompt shown, waiting for response...");
+        let granted = poll_until_granted(|| unsafe { AXIsProcessTrusted() }, POLL_TIMEOUT, POLL_INTERVAL);
+        println!("[PERMISSIONS] voice-typer Accessibility: resolved, granted={}", granted);
+    }
+
+    // --- Microphone (needed for cpal audio capture) ---
+    // cpal/CoreAudio has no AVFoundation-style requestAccess completion handler
+    // available without adding new crate dependencies; the OS shows its native
+    // mic dialog the moment a process actually opens an input stream. Briefly
+    // opening and immediately closing a real input stream here is the
+    // lightweight way to trigger that dialog proactively for this process's
+    // identity, instead of leaving it to fire during the user's first Record.
+    use voice_keyboard::audio::AudioRecorder;
+    match AudioRecorder::new().and_then(|mut r| r.start().map(|_| r)) {
+        Ok(mut recorder) => {
+            println!("[PERMISSIONS] voice-typer Microphone: stream opened (prompt shown if not yet determined)");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = recorder.stop();
+        }
+        Err(e) => {
+            println!("[PERMISSIONS] voice-typer Microphone: could not open input stream ({e}); OS dialog may not have been shown");
+        }
+    }
+
+    println!("[PERMISSIONS] voice-typer permission preflight complete");
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cli_request_permissions() {
+    println!("[PERMISSIONS] voice-typer permission preflight is a no-op on this platform");
+}
+
+/// `voice-typer --check-permissions`: print this process's own current
+/// Accessibility / Microphone status as one line of JSON and exit. Used by
+/// the wrapper's `check_permissions` Tauri command, since the sidecar is a
+/// distinct TCC identity from the wrapper process and the wrapper cannot
+/// query the sidecar's status in-process.
+#[cfg(target_os = "macos")]
+fn cli_check_permissions() {
+    let accessibility = unsafe { AXIsProcessTrusted() };
+    let microphone = mic_auth_status();
+    println!(
+        "{{\"accessibility\":{},\"microphone\":{}}}",
+        accessibility, microphone
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cli_check_permissions() {
+    println!("{{\"accessibility\":true,\"microphone\":true}}");
+}
+
 fn print_usage() {
     let default_key = HotkeyType::default_for_platform();
     println!("Usage: voice-typer [OPTIONS]");
@@ -2252,6 +2492,10 @@ fn print_usage() {
     println!("                       --openai --openrouter  → OAI primary, OR fallback");
     println!("  --list-models      List available model presets");
     println!("  --list-keys        List available hotkey options");
+    println!("  --request-permissions  Trigger this process's own macOS Accessibility /");
+    println!("                     Microphone permission dialogs, then exit");
+    println!("                     (used by the wrapper app during first-run onboarding)");
+    println!("  --check-permissions    Print this process's own permission status as JSON, then exit");
     println!("  --version, -V      Show version information");
     println!("  --help, -h         Show this help");
     println!();
@@ -2710,6 +2954,14 @@ fn main() {
             }
             "--list-keys" => {
                 list_keys();
+                return;
+            }
+            "--request-permissions" => {
+                cli_request_permissions();
+                return;
+            }
+            "--check-permissions" => {
+                cli_check_permissions();
                 return;
             }
             "--download" => {

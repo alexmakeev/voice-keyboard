@@ -43,18 +43,13 @@ pub struct UpdateInfo {
     pub last_check: String,
 }
 
-// macOS permission check APIs
-#[cfg(target_os = "macos")]
-#[link(name = "ApplicationServices", kind = "framework")]
-extern "C" {
-    fn AXIsProcessTrusted() -> bool;
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "ApplicationServices", kind = "framework")]
-extern "C" {
-    fn CGPreflightListenEventAccess() -> bool;
-}
+// NOTE: This wrapper process used to link ApplicationServices/CoreFoundation
+// directly to check/request its OWN Accessibility status. That was removed:
+// this wrapper process never calls enigo or rdev::grab — only the
+// voice-typer sidecar does — so the wrapper's own TCC identity has no
+// functional bearing on that permission. Both Accessibility and Microphone
+// status now come exclusively from the sidecar (see
+// `check_sidecar_permissions` / `SidecarPermissions` below).
 
 use debug_log::DebugLog;
 
@@ -631,30 +626,84 @@ async fn open_github_issue(zip_path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Check macOS permissions: microphone, accessibility, input monitoring
+/// Check macOS permissions: microphone, accessibility.
+///
+/// Accessibility is reported exclusively from the voice-typer sidecar's own
+/// status (queried by running `voice-typer --check-permissions`). This
+/// wrapper process never calls enigo or rdev::grab — only the sidecar does —
+/// so the wrapper's own TCC identity has no functional bearing on that
+/// permission, and checking it here would only prompt the user twice for the
+/// same permission.
 #[tauri::command]
-fn check_permissions() -> serde_json::Value {
+async fn check_permissions() -> serde_json::Value {
+    // Fine-grained status string (authorized/denied/restricted/not_determined), kept
+    // from the wrapper's own AVFoundation query purely for the UI's "blocked" banner
+    // messaging — it is never used to gate the `microphone` boolean below, which
+    // comes exclusively from the sidecar (the identity that actually opens the
+    // input stream).
     let microphone_status = mic_auth_status();
-    let accessibility;
-    let input_monitoring;
 
-    #[cfg(target_os = "macos")]
-    {
-        accessibility = unsafe { AXIsProcessTrusted() };
-        input_monitoring = unsafe { CGPreflightListenEventAccess() };
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        accessibility = true;
-        input_monitoring = true;
-    }
+    let sidecar = tokio::task::spawn_blocking(check_sidecar_permissions)
+        .await
+        .unwrap_or(SidecarPermissions::default());
 
     serde_json::json!({
-        "microphone": microphone_status == "authorized",
+        "microphone": sidecar.microphone,
         "microphone_status": microphone_status,
-        "accessibility": accessibility,
-        "input_monitoring": input_monitoring,
+        "accessibility": sidecar.accessibility,
     })
+}
+
+/// Parsed result of `voice-typer --check-permissions`. Fails CLOSED (all `false`)
+/// if the sidecar binary can't be found or run, or its output can't be parsed —
+/// an unverifiable sidecar permission must never be reported as granted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SidecarPermissions {
+    accessibility: bool,
+    microphone: bool,
+}
+
+/// Parse the sidecar's one-line `--check-permissions` JSON output into
+/// [`SidecarPermissions`]. Returns `None` if the line isn't valid JSON. Pure
+/// function, unit-tested below independent of the subprocess call itself.
+fn parse_sidecar_permissions(json_line: &str) -> Option<SidecarPermissions> {
+    let parsed: serde_json::Value = serde_json::from_str(json_line.trim()).ok()?;
+    Some(SidecarPermissions {
+        accessibility: parsed.get("accessibility").and_then(|v| v.as_bool()).unwrap_or(false),
+        microphone: parsed.get("microphone").and_then(|v| v.as_bool()).unwrap_or(false),
+    })
+}
+
+/// Run `voice-typer --check-permissions` and parse its one-line JSON status.
+/// Fails CLOSED (returns [`SidecarPermissions::default()`], i.e. all `false`) if
+/// the binary can't be found or run, or its output can't be parsed.
+fn check_sidecar_permissions() -> SidecarPermissions {
+    let path = match find_voice_typer_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("[permissions] Could not locate voice-typer binary to check its permissions: {}", e);
+            return SidecarPermissions::default();
+        }
+    };
+    let output = match Command::new(&path).arg("--check-permissions").output() {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!("[permissions] Failed to run voice-typer --check-permissions: {}", e);
+            return SidecarPermissions::default();
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(line) = stdout.lines().find(|l| l.trim_start().starts_with('{')) else {
+        tracing::warn!("[permissions] voice-typer --check-permissions produced no JSON output");
+        return SidecarPermissions::default();
+    };
+    match parse_sidecar_permissions(line) {
+        Some(permissions) => permissions,
+        None => {
+            tracing::warn!("[permissions] Failed to parse voice-typer --check-permissions output: {}", line);
+            SidecarPermissions::default()
+        }
+    }
 }
 
 /// Query current microphone authorization status via AVFoundation.
@@ -681,6 +730,82 @@ fn mic_auth_status() -> &'static str {
         } else {
             "denied"
         }
+    }
+}
+
+/// Run the voice-typer sidecar's `--request-permissions` preflight synchronously
+/// (blocking) and log its output. This is the one shared implementation used by
+/// both [`request_permissions_at_startup`] (fire-and-forget, from the Tauri `setup`
+/// hook) and the [`request_permissions`] command (awaited, from the frontend's
+/// "Grant Permissions" / "Recheck" button).
+///
+/// This wrapper process never calls enigo or rdev::grab and never captures audio
+/// itself — only the voice-typer sidecar does — so the wrapper's own TCC identity
+/// has no functional bearing on Accessibility, Input Monitoring, or Microphone.
+/// Requesting those permissions for the wrapper's own identity would only prompt
+/// the user twice for the same permission. The sidecar is a distinct code-signed
+/// identity (re-signed with its own entitlements in CI) and is the only process
+/// that needs to request these, via its own `--request-permissions` invocation.
+#[cfg(target_os = "macos")]
+fn run_sidecar_permission_preflight() {
+    match find_voice_typer_path() {
+        Ok(path) => {
+            tracing::info!("[permissions] voice-typer sidecar: running --request-permissions preflight...");
+            match Command::new(&path)
+                .arg("--request-permissions")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+            {
+                Ok(output) => {
+                    for line in String::from_utf8_lossy(&output.stdout).lines() {
+                        tracing::info!("[permissions] {}", line);
+                    }
+                    if !output.status.success() {
+                        tracing::warn!(
+                            "[permissions] voice-typer sidecar preflight exited with status {:?}",
+                            output.status.code()
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[permissions] Failed to run voice-typer sidecar preflight: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("[permissions] Could not locate voice-typer binary for sidecar preflight: {}", e);
+        }
+    }
+}
+
+/// Request all required macOS permissions at startup without opening the settings window.
+///
+/// Called once from the Tauri `setup` hook before the voice-typer child process starts.
+/// Fire-and-forget: app startup does not wait for the sidecar's dialogs to resolve.
+#[cfg(target_os = "macos")]
+fn request_permissions_at_startup() {
+    tauri::async_runtime::spawn(async {
+        tokio::task::spawn_blocking(run_sidecar_permission_preflight)
+            .await
+            .ok();
+    });
+}
+
+/// On-demand retry of the sidecar permission preflight, triggered by the frontend's
+/// "Grant Permissions" / "Recheck" button. Unlike [`request_permissions_at_startup`],
+/// this is awaited by the caller so the frontend can immediately follow up with a
+/// fresh `check_permissions` call once the dialogs have been shown (though the user
+/// may still need extra time to respond — the frontend should poll `check_permissions`
+/// afterwards rather than assume this call's return means "granted").
+#[tauri::command]
+async fn request_permissions() {
+    #[cfg(target_os = "macos")]
+    {
+        tokio::task::spawn_blocking(run_sidecar_permission_preflight)
+            .await
+            .ok();
     }
 }
 
@@ -742,9 +867,15 @@ fn test_recording_stop(state: State<AppState>) -> Result<(), String> {
 /// Restart voice-typer process (stop + start)
 #[tauri::command]
 fn restart_voice_typer(state: State<AppState>, app: AppHandle) -> Result<(), String> {
+    // stop_voice_typer() blocks until the old process is confirmed reaped
+    // (see its try_wait() polling loop above).
     stop_voice_typer(&state);
-    // Small safety buffer after kill+wait to allow OS to release file handles/ports
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Explicit 3s buffer AFTER confirming the old process has exited, so
+    // macOS has extra time to fully tear down its TCC/event-tap/audio-device
+    // state before the new process claims it. This is what previously caused
+    // intermittent EventTapError failures when the old and new processes'
+    // grab() calls raced.
+    std::thread::sleep(std::time::Duration::from_secs(3));
     start_voice_typer(&state, &app);
     if state.voice_typer.lock().unwrap().is_none() {
         return Err("voice-typer failed to start".to_string());
@@ -764,6 +895,29 @@ fn open_privacy_settings() -> Result<(), String> {
     {
         open::that("ms-settings:privacy-microphone")
             .map_err(|e| e.to_string())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // No standard settings URL on Linux
+        Ok(())
+    }
+}
+
+/// Open the Accessibility pane of System Settings > Privacy & Security.
+///
+/// Gives the user a reliable manual deep link next to the Accessibility row in the
+/// permissions modal, mirroring `open_privacy_settings` above.
+#[tauri::command]
+fn open_accessibility_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        open::that("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // No Accessibility privacy concept on Windows; nothing to open.
+        Ok(())
     }
     #[cfg(target_os = "linux")]
     {
@@ -1881,7 +2035,31 @@ fn stop_voice_typer(state: &AppState) {
     let mut guard = state.voice_typer.lock().unwrap();
     if let Some(mut child) = guard.take() {
         let _ = child.kill();
-        let _ = child.wait();
+        // Confirm the OS has actually reaped the process (releasing its
+        // CGEventTap/audio-device handles) before returning, rather than
+        // trusting kill() alone. Poll try_wait() instead of a plain blocking
+        // wait() so a pathological hang can't stall the caller forever: give
+        // it up to 5s, logging a warning and proceeding anyway if it doesn't
+        // exit cleanly in that time.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_status)) => break,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            "[restart] voice-typer did not exit within 5s of kill(); proceeding anyway"
+                        );
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    tracing::warn!("[restart] error waiting for voice-typer to exit: {}", e);
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -1928,6 +2106,23 @@ fn main() {
 
             let handle = app.handle().clone();
             let state = app.state::<AppState>();
+
+            // Show and focus the main settings window on launch. It starts hidden
+            // per `tauri.conf.json`'s `"visible": false` (so later re-opens from the
+            // tray don't flash it uninvited), but on app launch the user should see
+            // it right away — most notably so the permissions modal below is visible
+            // instead of silently waiting in the tray.
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+
+            // Request all required macOS permissions at startup.
+            // Shows system dialogs for Accessibility and Input Monitoring if not yet granted.
+            // Microphone is requested asynchronously to avoid blocking the event loop.
+            #[cfg(target_os = "macos")]
+            request_permissions_at_startup();
+
             start_voice_typer(&state, &handle);
 
             // Background periodic update check
@@ -2029,7 +2224,9 @@ fn main() {
             open_github_issue,
             check_permissions,
             request_microphone_permission,
+            request_permissions,
             open_privacy_settings,
+            open_accessibility_settings,
             restart_voice_typer,
             get_audio_devices,
             get_version_info,
@@ -2091,4 +2288,79 @@ fn load_config() -> AppConfig {
     }
 
     config
+}
+
+/// Unit tests for the pure permission-combining/parsing logic used by
+/// `check_permissions`. Run with `cargo test` from within `src-tauri/` (this
+/// binary crate is separate from the root `voice-keyboard` crate, so these do
+/// not run as part of the repo-root `cargo test`).
+///
+/// Only `parse_sidecar_permissions` is pure and testable here: it takes a JSON
+/// string and returns a `SidecarPermissions` value with no I/O. The two other
+/// "fail closed" paths mentioned in the original spec —
+/// `check_sidecar_permissions` returning `SidecarPermissions::default()` when
+/// the sidecar binary can't be found/run, and `check_permissions` combining
+/// that with `microphone_status` — both require shelling out to a subprocess
+/// or a `tauri::State`, so they aren't feasibly unit-testable without mocking
+/// scaffolding that doesn't otherwise exist in this crate. The subprocess
+/// fail-closed behavior is exercised indirectly by `parse_sidecar_permissions`
+/// returning `None` on unparseable output below (the same `None` branch
+/// `check_sidecar_permissions` falls back to `SidecarPermissions::default()`
+/// on when the process output is missing/malformed).
+#[cfg(test)]
+mod permission_tests {
+    use super::{parse_sidecar_permissions, SidecarPermissions};
+
+    #[test]
+    fn all_true_parses_to_all_true() {
+        let json = r#"{"accessibility":true,"microphone":true}"#;
+        assert_eq!(
+            parse_sidecar_permissions(json),
+            Some(SidecarPermissions {
+                accessibility: true,
+                microphone: true,
+            })
+        );
+    }
+
+    #[test]
+    fn any_false_field_stays_false() {
+        let json = r#"{"accessibility":false,"microphone":true}"#;
+        let parsed = parse_sidecar_permissions(json).expect("valid JSON must parse");
+        assert!(!parsed.accessibility);
+        assert!(parsed.microphone);
+
+        let json = r#"{"accessibility":true,"microphone":false}"#;
+        let parsed = parse_sidecar_permissions(json).expect("valid JSON must parse");
+        assert!(parsed.accessibility);
+        assert!(!parsed.microphone);
+    }
+
+    #[test]
+    fn all_false_parses_to_all_false() {
+        let json = r#"{"accessibility":false,"microphone":false}"#;
+        assert_eq!(
+            parse_sidecar_permissions(json),
+            Some(SidecarPermissions::default())
+        );
+    }
+
+    #[test]
+    fn missing_fields_fail_closed_to_false() {
+        // Only `microphone` present — accessibility must default to `false`
+        // rather than being treated as granted.
+        let json = r#"{"microphone":true}"#;
+        let parsed = parse_sidecar_permissions(json).expect("valid JSON must parse");
+        assert!(!parsed.accessibility);
+        assert!(parsed.microphone);
+    }
+
+    #[test]
+    fn malformed_json_fails_closed_to_none() {
+        // Mirrors what `check_sidecar_permissions` sees when the subprocess
+        // produces garbage/truncated output — it falls back to
+        // `SidecarPermissions::default()` (all false) in that case.
+        assert_eq!(parse_sidecar_permissions("not json"), None);
+        assert_eq!(parse_sidecar_permissions(""), None);
+    }
 }
