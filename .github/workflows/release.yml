@@ -394,19 +394,19 @@ jobs:
           fetch-depth: 0
 
       - name: Download Windows artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           name: voice-typer-windows-x64
           path: artifacts/
 
       - name: Download macOS ARM64 artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           name: macos-arm64
           path: artifacts/
 
       - name: Download macOS x64 artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           name: macos-x64
           path: artifacts/
