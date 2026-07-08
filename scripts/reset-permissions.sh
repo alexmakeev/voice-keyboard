@@ -39,7 +39,11 @@ fi
 
 # 3. Remove saved app state
 echo "[3/5] Clearing app state..."
-rm -rf ~/Library/Application\ Support/"${BUNDLE_ID}" 2>/dev/null || true
+# NOTE: the app's actual config/data dir (config.json, models/, audio history)
+# is named "voice-keyboard" (from the `directories` crate app-name path in
+# src/config.rs), NOT the bundle ID — unlike Caches/WebKit/SavedState below,
+# which macOS keys by bundle ID.
+rm -rf ~/Library/Application\ Support/voice-keyboard 2>/dev/null || true
 rm -rf ~/Library/Caches/"${BUNDLE_ID}" 2>/dev/null || true
 rm -rf ~/Library/WebKit/"${BUNDLE_ID}" 2>/dev/null || true
 rm -rf ~/Library/Saved\ Application\ State/"${BUNDLE_ID}.savedState" 2>/dev/null || true

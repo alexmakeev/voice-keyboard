@@ -6,8 +6,16 @@
     <key>com.apple.security.device.audio-input</key>
     <true/>
 
-    <!-- Required: sidecar (voice-typer) inherits parent's TCC identity so macOS
-         grants it the same microphone permission without a separate TCC prompt -->
+    <!-- com.apple.security.inherit lets this app act as a sandbox-inheriting helper
+         when launched BY another sandboxed parent (e.g. via NSWorkspace/XPC); it has
+         no effect on how this app's own children are treated. It does NOT make the
+         voice-typer sidecar inherit this app's TCC grants: the sidecar is spawned as
+         a plain child process (not launched through an inheriting-sandbox API) and is
+         signed under its own distinct code identity, so macOS TCC tracks it separately
+         and requires its own grants for microphone/Accessibility/Input Monitoring —
+         see check_sidecar_permissions()/run_sidecar_permission_preflight() in main.rs.
+         This entitlement is kept for compatibility/potential future embedding
+         scenarios; it is not load-bearing for the sidecar permission story. -->
     <key>com.apple.security.inherit</key>
     <true/>
 

@@ -35,6 +35,8 @@ cargo build --release --features "whisper,metal,opus"
 cargo tauri build
 ```
 
+For local permission testing, re-sign the built bundle with a stable Developer ID identity (avoids losing TCC grants on every rebuild): `scripts/local-codesign.sh` (opt-in, not run automatically by the build).
+
 ## Run
 
 ```bash
@@ -110,7 +112,7 @@ Tauri App (src-tauri/)                  <- Optional desktop wrapper
 
 ## Config File
 
-Location: `~/.config/voice-keyboard/config.json`
+Location: `~/Library/Application Support/voice-keyboard/config.json` (macOS; via the `directories` crate's `BaseDirs::config_dir()`)
 
 ## Project Conventions
 

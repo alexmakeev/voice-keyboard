@@ -962,13 +962,21 @@ body {
 }
 
 .modal-actions {
-    display: flex;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
     gap: 12px;
     margin-top: 20px;
 }
 
+/* Used when only one action button remains (e.g. permissions modal after
+   removing the redundant global "Grant Permissions" button) so it spans
+   the full width instead of being stuck in a half-width grid column. */
+.modal-actions.single-action {
+    grid-template-columns: 1fr;
+}
+
 .modal-actions .btn {
-    flex: 1;
+    width: 100%;
     justify-content: center;
 }
 
@@ -982,8 +990,9 @@ body {
 
 .permission-item {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 12px;
+    gap: 8px 12px;
     padding: 12px;
     background: var(--bg-primary);
     border-radius: 8px;
@@ -1001,6 +1010,11 @@ body {
     text-align: center;
 }
 
+.perm-text {
+    flex: 1 1 160px;
+    min-width: 0;
+}
+
 .perm-name {
     font-weight: 600;
     font-size: 14px;
@@ -1010,6 +1024,14 @@ body {
     font-size: 12px;
     color: var(--text-secondary);
     margin-top: 2px;
+}
+
+.btn-open-settings {
+    flex-shrink: 0;
+    padding: 6px 10px;
+    font-size: 12px;
+    white-space: nowrap;
+    margin-left: auto;
 }
 
 /* Scrollbar */

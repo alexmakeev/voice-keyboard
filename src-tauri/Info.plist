@@ -9,9 +9,5 @@
     <!-- Required: microphone access for voice recording -->
     <key>NSMicrophoneUsageDescription</key>
     <string>Voice Keyboard needs microphone access to record your voice for speech-to-text transcription.</string>
-
-    <!-- Required: accessibility for typing transcribed text into apps -->
-    <key>NSAppleEventsUsageDescription</key>
-    <string>Voice Keyboard needs accessibility access to type transcribed text into other applications.</string>
 </dict>
 </plist>
