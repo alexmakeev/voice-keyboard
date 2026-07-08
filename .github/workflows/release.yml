@@ -393,10 +393,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Download Windows artifacts
+      - name: Download Windows CLI artifacts
         uses: actions/download-artifact@v6
         with:
-          name: voice-typer-windows-x64
+          name: voice-typer-x86_64-pc-windows-msvc
+          path: artifacts/
+
+      - name: Download Windows installer artifacts
+        uses: actions/download-artifact@v6
+        with:
+          name: voice-keyboard-windows-x64-setup
           path: artifacts/
 
       - name: Download macOS ARM64 artifacts
@@ -451,12 +457,12 @@ jobs:
           > Note: The DMG is unsigned. On first launch, right-click → Open, or go to System Preferences → Privacy & Security → Open Anyway.
 
           ### Windows
-          - **Windows x64:** `voice-typer-windows-x64.zip`
+          - **Windows x64:** `voice-typer-x86_64-pc-windows-msvc.zip`
 
           ### Standalone voice-typer binary
           - `voice-typer-macos-arm64.zip`
           - `voice-typer-macos-x64.zip`
-          - `voice-typer-windows-x64.zip`
+          - `voice-typer-x86_64-pc-windows-msvc.zip`
 
           ## Checksums
           See `SHA256SUMS.txt` for file integrity verification.
