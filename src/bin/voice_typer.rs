@@ -1032,6 +1032,40 @@ impl VadPhraseDetector {
     }
 }
 
+/// Guards short recordings against Whisper/GPT-4o hallucinating text on
+/// near-silent audio (e.g. an accidental hotkey tap with no speech). Returns
+/// `Some(voice_percent)` -- the actual voice ratio found, for logging -- when
+/// the recording is both short (< SHORT_RECORDING_THRESHOLD_MS) AND lacks
+/// real voice content, meaning the caller should skip transcription entirely
+/// rather than send it to the model. Returns `None` when transcription
+/// should proceed (either the recording is long enough that a few silent/
+/// noisy windows aren't a meaningful signal, or real voice was detected).
+///
+/// Longer recordings are intentionally NOT gated by this check: it exists to
+/// catch the specific "pressed and released without speaking" case, not to
+/// second-guess genuine multi-second recordings.
+///
+/// This reuses `VadPhraseDetector::has_voice_content` -- the same RMS-energy
+/// + voice-ratio analysis the VAD phrase-splitter already relies on for
+/// mid-recording phrase segmentation -- so silence/voice detection has a
+/// single implementation shared by every transcription-mode code path,
+/// rather than each mode reinventing its own threshold.
+fn silent_short_recording_voice_percent(
+    vad: &VadPhraseDetector,
+    phrase_samples: &[f32],
+    duration_ms: u64,
+) -> Option<f32> {
+    if duration_ms >= SHORT_RECORDING_THRESHOLD_MS {
+        return None;
+    }
+    let (has_voice, voice_percent) = vad.has_voice_content(phrase_samples);
+    if has_voice {
+        None
+    } else {
+        Some(voice_percent)
+    }
+}
+
 // ============================================================================
 // Configuration and CLI
 // ============================================================================
@@ -7692,6 +7726,30 @@ fn run(
                     if let Some((phrase_samples, _start_pos, _end_pos)) = remaining {
                         let duration_secs =
                             phrase_samples.len() as f32 / RECORDING_SAMPLE_RATE as f32;
+                        let duration_ms = (duration_secs * 1000.0) as u64;
+
+                        // Guard against hallucinated text on a short, silent/near-silent
+                        // recording (e.g. an accidental hotkey tap) -- skip transcription
+                        // entirely instead of sending near-empty audio to Whisper.
+                        let voice_gate = {
+                            let vad = vad_clone.lock().unwrap();
+                            silent_short_recording_voice_percent(&vad, &phrase_samples, duration_ms)
+                        };
+                        if let Some(voice_percent) = voice_gate {
+                            println!(
+                                "[{}] Short recording ({:.1}s) with no voice detected ({:.0}% < {:.0}% threshold), skipping",
+                                timestamp(),
+                                duration_secs,
+                                voice_percent * 100.0,
+                                MIN_VOICE_RATIO_FOR_SPEECH * 100.0
+                            );
+                            std::io::stdout().flush().ok();
+                            samples_clone.lock().unwrap().clear();
+                            last_phrase_clone.lock().unwrap().clear();
+                            vad_clone.lock().unwrap().reset();
+                            return;
+                        }
+
                         println!(
                             "[{}] Final phrase ({:.1}s), transcribing...",
                             timestamp(),
@@ -7717,14 +7775,25 @@ fn run(
                             Ok(text) => {
                                 // Filter hallucinations - only for short segments
                                 if is_hallucination(&text, duration_secs) {
-                                    // Already logged in is_hallucination
+                                    // Already logged in is_hallucination. This is a
+                                    // terminal outcome for the recording (nothing will
+                                    // be typed) -- print a "Done" so the frontend's
+                                    // status parsing (extract_status() in
+                                    // src-tauri/src/main.rs) resets the record circle
+                                    // to idle instead of leaving it stuck on "Sending...".
+                                    println!("[{}] Done", timestamp());
+                                    std::io::stdout().flush().ok();
                                 } else if is_duration_hallucination(&text, duration_secs) {
-                                    // Already logged
+                                    // Already logged; see "Done" comment above.
+                                    println!("[{}] Done", timestamp());
+                                    std::io::stdout().flush().ok();
                                 } else if context
                                     .as_ref()
                                     .map_or(false, |ctx| is_duplicate_segment(&text, ctx))
                                 {
-                                    // Already logged in is_duplicate_segment
+                                    // Already logged in is_duplicate_segment; see "Done" comment above.
+                                    println!("[{}] Done", timestamp());
+                                    std::io::stdout().flush().ok();
                                 } else if !text.is_empty() {
                                     // Save audio for analysis
                                     let audio_file =
@@ -8108,6 +8177,35 @@ fn run_openrouter(
                         return;
                     }
 
+                    // Guard against hallucinated text on a short, silent/near-silent
+                    // recording (e.g. an accidental hotkey tap) -- skip transcription
+                    // entirely instead of sending near-empty audio to the API.
+                    {
+                        let raw_duration_ms = (phrase_samples.len() as f32
+                            / RECORDING_SAMPLE_RATE as f32
+                            * 1000.0) as u64;
+                        let voice_gate = {
+                            let vad = vad_clone.lock().unwrap();
+                            silent_short_recording_voice_percent(
+                                &vad,
+                                &phrase_samples,
+                                raw_duration_ms,
+                            )
+                        };
+                        if let Some(voice_percent) = voice_gate {
+                            println!(
+                                "[{}] Short recording ({:.1}s) with no voice detected ({:.0}% < {:.0}% threshold), skipping",
+                                timestamp(),
+                                raw_duration_ms as f32 / 1000.0,
+                                voice_percent * 100.0,
+                                MIN_VOICE_RATIO_FOR_SPEECH * 100.0
+                            );
+                            std::io::stdout().flush().ok();
+                            samples_clone.lock().unwrap().clear();
+                            return;
+                        }
+                    }
+
                     let resampled = resample_48k_to_16k(&phrase_samples);
                     let duration_secs = resampled.len() as f32 / 16000.0;
                     println!("[{}] Encoding {:.1}s audio...", timestamp(), duration_secs);
@@ -8464,6 +8562,35 @@ fn run_cloud(
                     if phrase_samples.is_empty() {
                         println!("[{}] No audio captured", timestamp());
                         return;
+                    }
+
+                    // Guard against hallucinated text on a short, silent/near-silent
+                    // recording (e.g. an accidental hotkey tap) -- skip transcription
+                    // entirely instead of sending near-empty audio to the API.
+                    {
+                        let raw_duration_ms = (phrase_samples.len() as f32
+                            / RECORDING_SAMPLE_RATE as f32
+                            * 1000.0) as u64;
+                        let voice_gate = {
+                            let vad = vad_clone.lock().unwrap();
+                            silent_short_recording_voice_percent(
+                                &vad,
+                                &phrase_samples,
+                                raw_duration_ms,
+                            )
+                        };
+                        if let Some(voice_percent) = voice_gate {
+                            println!(
+                                "[{}] Short recording ({:.1}s) with no voice detected ({:.0}% < {:.0}% threshold), skipping",
+                                timestamp(),
+                                raw_duration_ms as f32 / 1000.0,
+                                voice_percent * 100.0,
+                                MIN_VOICE_RATIO_FOR_SPEECH * 100.0
+                            );
+                            std::io::stdout().flush().ok();
+                            samples_clone.lock().unwrap().clear();
+                            return;
+                        }
                     }
 
                     // Resample to 16kHz (needed for both backends)

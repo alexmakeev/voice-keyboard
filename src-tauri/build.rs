@@ -14,5 +14,14 @@ fn main() {
     println!("cargo:rustc-env=APP_VERSION={}", version);
     println!("cargo:rerun-if-changed=tauri.conf.json");
 
+    // frontendDist ("../ui") is a plain static directory, not a JS build
+    // output -- there is no bundler step that would otherwise put its files
+    // on Cargo's dependency graph. Without an explicit rerun-if-changed here,
+    // Cargo can decide no tracked input changed and skip re-embedding the
+    // frontend assets into the binary, silently shipping a stale UI (HTML/
+    // CSS/JS) even though the source files on disk are current. Watch the
+    // whole tree so any edit under ui/ forces a rebuild.
+    println!("cargo:rerun-if-changed=../ui");
+
     tauri_build::build()
 }

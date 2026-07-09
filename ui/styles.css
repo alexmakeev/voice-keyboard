@@ -14,6 +14,7 @@
     --orange: #f4845f;
     --border: #2a2a4a;
     --shadow: rgba(0, 0, 0, 0.3);
+    --cta-blue: #5ac8fa; /* brighter/more saturated than --info, used for the record CTA captions */
 }
 
 * {
@@ -39,317 +40,367 @@ body {
     height: 100vh;
     max-width: 100%;
     overflow: hidden;
+    position: relative;
 }
 
 .hidden {
     display: none !important;
 }
 
-/* Header */
+/* ============================================================
+   Header: logo/name/version on the left, connection badge + gear
+   on the right. Replaces the old tab bar.
+   ============================================================ */
 .header {
     background: var(--bg-secondary);
-    padding: 16px;
+    padding: 14px 16px;
     border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    position: relative;
+}
+
+.header-logo {
+    width: 39px;
+    height: 39px;
+    border-radius: 8px;
+    flex-shrink: 0;
+}
+
+.header-brand-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
 }
 
 .header h1 {
-    font-size: 18px;
+    font-size: 17px;
     font-weight: 600;
-    margin-bottom: 12px;
+    line-height: 1.1;
 }
 
-.tabs {
-    display: flex;
-    width: 100%;
-    gap: 0;
-}
-
-.tab {
-    flex: 1 1 0;
-    text-align: center;
-    background: transparent;
-    border: none;
+.header-version {
+    font-size: 11px;
     color: var(--text-secondary);
-    padding: 8px 4px;
+}
+
+/* Vertical centering is delegated entirely to `.header`'s `align-items:
+   center` (see above) -- this used to be `position: absolute; top: 10px`
+   with a hardcoded pixel offset that approximated the header's true center
+   instead of actually being centered by flexbox, which is why it could
+   drift out of alignment with the gear icon. `margin-left: auto` pushes
+   this group to the right edge of the flex row while remaining a normal
+   flex item, so its cross-axis position is always exactly centered
+   relative to its flex siblings (logo, brand text) -- guaranteed
+   structurally rather than by a magic number staying in sync by
+   coincidence. */
+.header-actions {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* Shared "bare icon" interaction pattern: no button chrome, dim at rest,
+   brighter on hover with a smooth transition. Applies to the gear icon and
+   the settings panel's close (X) icon -- any future bare/icon-only control
+   should reuse this class rather than inventing a new hover treatment. */
+.icon-btn {
+    border: none;
+    background: transparent;
+    padding: 0;
+    width: 39px;
+    height: 39px;
+    color: #ffffff;
+    opacity: 0.5;
+    font-size: 39px;
+    line-height: 1;
     cursor: pointer;
-    border-radius: 6px;
-    font-size: 14px;
-    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: opacity 0.2s ease;
+}
+
+.icon-btn:hover {
+    opacity: 0.7;
+}
+
+.gear-btn.active {
+    color: var(--accent);
+    opacity: 1;
+}
+
+.gear-icon {
+    position: relative;
+    display: block;
+}
+
+/* ---- Connection status badge (compact pill, sits left of the gear icon) ----
+   Muted pattern: dark-tinted low-alpha background, low-alpha state-color
+   border, desaturated/dimmed label text -- reads as a quiet, low-contrast
+   chip rather than a saturated highlight, while remaining legible and
+   distinguishable state-to-state. */
+.connection-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 20px;
+    padding: 0 6px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1;
+    white-space: nowrap;
+    box-sizing: border-box;
+}
+
+.connection-badge-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    line-height: 1;
+    width: 10px;
+    height: 10px;
+}
+
+.connection-badge.state-connected {
+    background: rgba(78, 204, 163, 0.10);
+    color: #8fbfa9;
+    border: 1px solid rgba(78, 204, 163, 0.35);
+}
+
+.connection-badge.state-connecting {
+    background: rgba(255, 193, 7, 0.10);
+    color: #d9c17f;
+    border: 1px solid rgba(255, 193, 7, 0.35);
+}
+
+.connection-badge.state-error {
+    background: rgba(233, 69, 96, 0.10);
+    color: #d98fa0;
+    border: 1px solid rgba(233, 69, 96, 0.35);
+}
+
+.connection-spinner {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    border: 1.5px solid rgba(217, 193, 127, 0.35);
+    border-top-color: #d9c17f;
+    animation: connection-spin 0.7s linear infinite;
+}
+
+@keyframes connection-spin {
+    to { transform: rotate(360deg); }
+}
+
+/* ============================================================
+   Main screen (was the "Status" tab; now the only home screen)
+   ============================================================ */
+.main-screen {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+}
+
+.record-instruction {
+    text-align: center;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--cta-blue);
+    padding: 28px 24px 0;
+    margin-bottom: 0;
+}
+
+.record-instruction kbd {
+    background: var(--bg-tertiary);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 12px;
+    color: var(--text-primary);
+}
+
+/* Record button: large circular centerpiece with 3 states (idle / listening / sending) */
+.record-circle-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 28px 24px 28px;
+}
+
+.record-circle {
+    position: relative;
+    width: 152px;
+    height: 152px;
+    border-radius: 50%;
+    border: none;
+    background: transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    touch-action: none;
     user-select: none;
     -webkit-user-select: none;
     -moz-user-select: none;
 }
 
-.tab:hover {
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-}
-
-.tab.active {
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-}
-
-/* Tab Content */
-.tab-content {
-    display: none;
-    flex: 1;
-    overflow: hidden;
-    flex-direction: column;
-}
-
-.tab-content.active {
-    display: flex;
-}
-
-#settings-tab {
-    overflow-y: auto;
-}
-
-#prompts-tab {
-    overflow-y: auto;
-}
-
-/* Status Bar */
-.status-bar {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 12px 16px;
-    background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border);
-}
-
-.status-indicator {
-    width: 12px;
-    height: 12px;
+/* Scalable visual layer: holds background/box-shadow and is the ONLY element
+   that transform: scale(...) is applied to for the listening/sending state
+   changes. Kept separate from .record-circle-label (below) so the label's
+   font-size never scales with it -- text renders identically across all
+   three states. */
+.record-circle-body {
+    position: absolute;
+    inset: 0;
     border-radius: 50%;
-    background: var(--text-secondary);
-    flex-shrink: 0;
-}
-
-.status-indicator.idle {
-    background: var(--success);
-}
-
-.status-indicator.recording {
-    background: var(--accent);
-    animation: pulse 1s infinite;
-}
-
-.status-indicator.sending {
-    background: var(--orange);
-    animation: pulse 0.8s infinite;
-}
-
-.status-indicator.processing {
-    background: var(--warning);
-    animation: pulse 0.5s infinite;
-}
-
-.status-indicator.typing {
-    background: var(--success);
-    animation: pulse-fast 0.3s infinite;
-}
-
-.status-indicator.connecting {
-    background: var(--info);
-    animation: pulse 1.5s infinite;
-}
-
-.status-indicator.error {
-    background: var(--accent);
-}
-
-.status-indicator.disconnected {
-    background: var(--text-secondary);
-}
-
-@keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
-}
-
-@keyframes pulse-fast {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
-}
-
-.status-text {
-    font-size: 14px;
-    flex: 1;
-}
-
-/* Connection Badge */
-.connection-badge {
-    font-size: 11px;
-    padding: 2px 8px;
-    border-radius: 10px;
-    font-weight: 500;
-    flex-shrink: 0;
-}
-
-.connection-badge.connected {
-    background: rgba(78, 204, 163, 0.2);
-    color: var(--success);
-}
-
-.connection-badge.connecting {
-    background: rgba(78, 168, 222, 0.2);
-    color: var(--info);
-}
-
-.connection-badge.disconnected {
-    background: rgba(160, 160, 160, 0.2);
-    color: var(--text-secondary);
-}
-
-.connection-badge.error {
-    background: rgba(233, 69, 96, 0.2);
-    color: var(--accent);
-}
-
-.hotkey-hint {
-    font-size: 12px;
-    color: var(--text-secondary);
-}
-
-.hotkey-hint kbd {
-    background: var(--bg-tertiary);
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-family: monospace;
-}
-
-/* Test Tab */
-.test-info {
-    display: flex;
-    gap: 8px;
-    padding: 12px 16px;
     background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border);
+    box-shadow: 0 4px 18px var(--shadow);
+    transform: scale(1);
+    transition: background-color 0.32s ease, box-shadow 0.32s ease, transform 0.32s ease;
 }
 
-.info-card {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding: 10px 12px;
-    background: var(--bg-primary);
-    border-radius: 8px;
-}
-
-.info-label {
-    font-size: 11px;
-    color: var(--text-secondary);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-}
-
-.info-value {
-    font-size: 14px;
-    font-weight: 500;
-}
-
-.info-value.connected {
-    color: var(--success);
-}
-
-.info-value.disconnected {
-    color: var(--text-secondary);
-}
-
-.info-value.error {
-    color: var(--accent);
-}
-
-.info-value kbd {
-    background: var(--bg-tertiary);
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-family: monospace;
-    font-size: 13px;
-}
-
-.hotkey-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 12px;
-    padding: 40px 20px;
-    margin: 16px;
-    border-radius: 12px;
-    transition: all 0.3s;
-}
-
-.hotkey-state.idle {
-    background: var(--bg-secondary);
-}
-
-.hotkey-state.recording {
-    background: rgba(233, 69, 96, 0.15);
-    animation: pulse-bg 1.5s infinite;
-}
-
-.hotkey-state.processing {
-    background: rgba(255, 193, 7, 0.15);
-}
-
-@keyframes pulse-bg {
-    0%, 100% { background: rgba(233, 69, 96, 0.15); }
-    50% { background: rgba(233, 69, 96, 0.25); }
-}
-
-.hotkey-icon {
-    font-size: 48px;
-    line-height: 1;
-}
-
-.hotkey-label {
+.record-circle-label {
+    position: relative;
+    z-index: 1;
     font-size: 16px;
-    color: var(--text-secondary);
+    font-weight: 700;
+    text-align: center;
+    padding: 0 14px;
+    pointer-events: none;
 }
 
-.hotkey-state.recording .hotkey-label {
-    color: var(--accent);
-    font-weight: 500;
-}
-
-.hotkey-state.processing .hotkey-label {
-    color: var(--warning);
-    font-weight: 500;
-}
-
-.hotkey-label kbd {
+.record-circle-label kbd {
     background: var(--bg-tertiary);
     padding: 2px 8px;
     border-radius: 4px;
     font-family: monospace;
+}
+
+/* Ring: pulses gently in idle (waiting-for-input cue), spins during
+   "sending" (progress cue). Base transition lets the ring collapse smoothly
+   (snappy 0.35s) when an animation-driven state (idle/sending) is switched
+   away from, distinct from the slow 5s idle "breathing". */
+.record-circle-ring {
+    position: absolute;
+    inset: -8px;
+    border-radius: 50%;
+    border: 2px solid var(--info);
+    opacity: 0;
+    transform: scale(1);
+    pointer-events: none;
+    transition: opacity 0.35s ease, transform 0.35s ease, border-width 0.35s ease;
+}
+
+.record-circle.state-idle .record-circle-ring {
+    opacity: 1;
+    animation: idle-ring-pulse 5s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+}
+
+@keyframes idle-ring-pulse {
+    0%, 100% { transform: scale(1); opacity: 0.5; }
+    50% { transform: scale(1.1); opacity: 0.12; }
+}
+
+/* Listening: circle body tightens slightly ("focusing in"). Only
+   .record-circle-body scales here -- .record-circle-label is a sibling
+   outside this element, so its font-size is unaffected. */
+.record-circle.state-listening .record-circle-body {
+    background: rgba(233, 69, 96, 0.16);
+    box-shadow: 0 0 0 8px rgba(233, 69, 96, 0.14), 0 4px 18px var(--shadow);
+    transform: scale(0.87);
+}
+
+.record-circle.state-listening .record-circle-label {
+    color: var(--accent);
+}
+
+/* Sending: circle body grows back past idle size and shifts to a third,
+   distinct color (purple) */
+.record-circle.state-sending .record-circle-body {
+    background: rgba(155, 89, 217, 0.18);
+    box-shadow: 0 0 0 8px rgba(155, 89, 217, 0.15), 0 4px 18px var(--shadow);
+    transform: scale(1.04);
+}
+
+.record-circle.state-sending .record-circle-label {
+    color: #9b59d9;
+}
+
+.record-circle.state-sending .record-circle-ring {
+    opacity: 1;
+    border-color: #9b59d9;
+    border-top-color: transparent;
+    border-right-color: transparent;
+    animation: sending-ring-spin 0.8s linear infinite;
+}
+
+@keyframes sending-ring-spin {
+    to { transform: rotate(360deg); }
 }
 
 .test-result {
-    flex: 1;
-    overflow-y: auto;
     padding: 0 16px 16px;
 }
 
 .test-result-text {
-    padding: 16px;
+    display: block;
+    width: 100%;
+    padding: 12px 14px;
     background: var(--bg-secondary);
+    border: 1px solid var(--border);
     border-radius: 8px;
-    min-height: 80px;
-    font-size: 15px;
-    line-height: 1.6;
+    min-height: 90px;
+    font-size: 14px;
+    font-family: inherit;
+    color: var(--text-primary);
+    line-height: 1.5;
+    resize: vertical;
+    cursor: text;
+    user-select: text;
+    -webkit-user-select: text;
+    -moz-user-select: text;
 }
 
-.test-result-text .placeholder {
+.test-result-text:hover,
+.test-result-text:focus {
+    border-color: var(--info);
+    outline: none;
+}
+
+.test-result-text::placeholder {
     color: var(--text-secondary);
+    opacity: 0.45;
     font-style: italic;
 }
 
-/* Log Container */
+.test-result-caption {
+    margin-top: 28px;
+    padding: 0 2px;
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.5;
+    color: var(--cta-blue);
+    text-align: center;
+}
+
+.test-result-caption kbd {
+    background: var(--bg-tertiary);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 11px;
+}
+
+/* Log Container (transcription history, currently unused but kept for
+   compatibility with any future re-introduction) */
 .log-container {
     flex: 1;
     overflow-y: auto;
@@ -405,22 +456,28 @@ body {
     border-top: 1px solid var(--border);
 }
 
-/* Debug Tab */
+/* ============================================================
+   Log panel (revealed inside Settings via the "Show Log" button)
+   ============================================================ */
+.log-panel-section {
+    border-top: 1px solid var(--border);
+}
+
 .debug-toolbar {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
     padding: 8px 16px;
     background: var(--bg-secondary);
-    border-bottom: 1px solid var(--border);
     flex-wrap: wrap;
+    width: 100%;
 }
 
 .debug-filters {
     display: flex;
     gap: 4px;
     flex-wrap: wrap;
-    flex: 1;
+    width: 100%;
 }
 
 .filter-chip {
@@ -456,36 +513,16 @@ body {
     color: var(--success);
 }
 
-.debug-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-shrink: 0;
-}
-
-.auto-scroll-toggle {
-    font-size: 11px;
-    color: var(--text-secondary);
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    user-select: none;
-}
-
-.auto-scroll-toggle input {
-    accent-color: var(--info);
-}
-
 .btn-small {
     padding: 4px 12px;
     font-size: 12px;
 }
 
 .debug-log-container {
-    flex: 1;
+    max-height: 200px;
     overflow-y: auto;
     padding: 8px;
+    background: var(--bg-primary);
 }
 
 .debug-log {
@@ -573,7 +610,10 @@ body {
 .mode-card {
     flex: 1;
     display: flex;
-    padding: 12px;
+    /* Left padding reduced 12px -> 6px to compensate for the native radio
+       input (hidden below) being pulled out of view/flow -- without this
+       the content would sit flush against the card edge. */
+    padding: 12px 12px 12px 6px;
     background: var(--bg-secondary);
     border-radius: 8px;
     cursor: pointer;
@@ -581,6 +621,9 @@ body {
     transition: all 0.2s;
 }
 
+/* Hide the native radio from view (still in the DOM, still gets `.checked`
+   toggled by the click handler) so the card reads as a clean text card
+   instead of a radio-button list. */
 .mode-card input {
     display: none;
 }
@@ -620,7 +663,10 @@ body {
 .model-item {
     display: flex;
     align-items: center;
-    padding: 12px;
+    /* Left padding reduced 12px -> 6px to match .mode-card -- compensates
+       for the .radio selection dot (hidden below) being pulled out of
+       view/flow. */
+    padding: 12px 12px 12px 6px;
     background: var(--bg-secondary);
     border-radius: 8px;
     cursor: pointer;
@@ -636,15 +682,18 @@ body {
     border-color: var(--accent);
 }
 
+/* Hidden from view -- selection is now communicated purely via the
+   border/background of .model-item.selected, same pattern as .mode-card. */
 .model-item .radio {
+    display: none;
     width: 18px;
     height: 18px;
     border: 2px solid var(--text-secondary);
     border-radius: 50%;
     margin-right: 12px;
-    display: flex;
     align-items: center;
     justify-content: center;
+    flex-shrink: 0;
 }
 
 .model-item.selected .radio {
@@ -746,11 +795,20 @@ body {
     text-align: right;
 }
 
-/* Select */
+/* Select -- shared by Hotkey, Language, Input Method, Microphone and any
+   other dropdown. appearance:none + custom SVG chevron, positioned further
+   from the edge than the native arrow so it doesn't sit flush against the
+   border. */
 .select {
     width: 100%;
-    padding: 12px;
-    background: var(--bg-secondary);
+    padding: 10px 34px 10px 12px;
+    background-color: var(--bg-secondary);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6' fill='none'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%23a0a0a0' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 14px center;
+    appearance: none;
+    -webkit-appearance: none;
+    -moz-appearance: none;
     border: 1px solid var(--border);
     border-radius: 8px;
     color: var(--text-primary);
@@ -816,6 +874,15 @@ body {
     border-radius: 6px;
 }
 
+/* Plain, subtle hint text directly under a field -- no box/background,
+   unlike .field-note above. Used where the caption shouldn't visually
+   compete with the input (e.g. Minimum Duration). */
+.field-hint {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin: 0;
+}
+
 /* Toggle Switch */
 .toggle-field {
     display: flex;
@@ -868,6 +935,42 @@ body {
 /* Settings Actions */
 .settings-actions {
     padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+/* "Show Log" / "Hide Log" collapsible-section header -- plain clickable
+   text, not a button, matching the accordion look of a disclosure row. */
+.log-disclosure {
+    background: none;
+    border: none;
+    padding: 4px 0;
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+    width: 100%;
+    text-align: left;
+}
+
+.log-disclosure:hover {
+    color: var(--text-primary);
+}
+
+.log-disclosure-chevron {
+    display: inline-block;
+    font-size: 9px;
+    line-height: 1;
+    transition: transform 0.2s ease;
+}
+
+.log-disclosure.expanded .log-disclosure-chevron {
+    transform: rotate(90deg);
 }
 
 /* Buttons */
@@ -911,6 +1014,19 @@ body {
 
 .btn-danger:hover {
     background: var(--accent-hover);
+}
+
+/* "Update" button shown in the Settings version-status row when a newer
+   version is available. Uses the app's existing --orange accent so it
+   stays consistent with other warning/attention-drawing UI. */
+.btn-update-orange {
+    background: rgba(244, 132, 95, 0.18);
+    color: var(--orange);
+    border: 1px solid rgba(244, 132, 95, 0.4);
+}
+
+.btn-update-orange:hover {
+    background: rgba(244, 132, 95, 0.3);
 }
 
 /* Modal */
@@ -1003,6 +1119,10 @@ body {
     border-left-color: var(--success);
 }
 
+.permission-item.perm-denied {
+    border-left-color: var(--accent);
+}
+
 .perm-icon {
     font-size: 20px;
     flex-shrink: 0;
@@ -1052,7 +1172,65 @@ body {
     background: var(--text-secondary);
 }
 
-/* App Info Header */
+/* ============================================================
+   Settings slide-over panel (opened via the gear icon)
+   ============================================================ */
+.settings-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex;
+    align-items: stretch;
+    justify-content: flex-end;
+    z-index: 500;
+}
+
+.settings-panel {
+    width: 88%;
+    max-width: 420px;
+    height: 100%;
+    background: var(--bg-primary);
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    box-shadow: -8px 0 24px var(--shadow);
+    animation: slidein 0.18s ease-out;
+}
+
+@keyframes slidein {
+    from { transform: translateX(24px); opacity: 0; }
+    to { transform: translateX(0); opacity: 1; }
+}
+
+.settings-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary);
+}
+
+.settings-panel-header h2 {
+    font-size: 15px;
+    font-weight: 600;
+    text-transform: none;
+    color: var(--text-primary);
+    letter-spacing: normal;
+}
+
+/* .settings-panel-close reuses the shared .icon-btn bare-icon pattern
+   (see above) -- no button chrome, dim at rest, brighter on hover. */
+.settings-panel-close {
+    font-size: 22px;
+}
+
+.settings-panel-body {
+    flex: 1;
+    overflow-y: auto;
+}
+
+/* App Info Header (also used for the Settings version-status row) */
 .app-info-header {
     display: flex;
     align-items: center;
@@ -1067,6 +1245,12 @@ body {
     height: 48px;
     border-radius: 10px;
     flex-shrink: 0;
+}
+
+.app-info-status {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
 }
 
 .app-info-details {
@@ -1319,15 +1503,15 @@ textarea,
 h1, h2, h3, h4, h5, h6,
 .field-label,
 .section-title,
-.info-label,
-.info-value,
 .mode-card-title,
 .mode-card-desc,
 .model-name,
 .model-desc,
 .model-size,
-.status-text,
-.hotkey-hint,
+.header-version,
+.record-instruction,
+.record-circle-label,
+.test-result-caption,
 .version-label,
 .update-message,
 .update-hint,
@@ -1335,61 +1519,11 @@ h1, h2, h3, h4, h5, h6,
 .perm-desc,
 .toggle-label,
 .field-note,
+.field-hint,
 .app-name,
 .app-version,
 .app-update-status {
     user-select: none;
     -webkit-user-select: none;
     -moz-user-select: none;
-}
-
-/* ============================================================
-   Record Button (Fix 3: big push-to-talk button via mouse)
-   ============================================================ */
-
-.record-test-btn {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 12px;
-    width: min(200px, 60%);
-    height: 200px;
-    margin: 0 auto;
-    border: none;
-    border-radius: 16px;
-    background: var(--bg-secondary);
-    color: var(--text-secondary);
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s, transform 0.1s;
-    user-select: none;
-    -webkit-user-select: none;
-    -moz-user-select: none;
-    outline: none;
-    touch-action: none;
-}
-
-.record-test-btn .record-btn-icon {
-    font-size: 48px;
-    line-height: 1;
-    pointer-events: none;
-}
-
-.record-test-btn .record-btn-label {
-    font-size: 16px;
-    font-weight: 500;
-    pointer-events: none;
-}
-
-.record-test-btn:hover {
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-}
-
-.record-test-btn:active,
-.record-test-btn.recording {
-    background: rgba(233, 69, 96, 0.25);
-    color: var(--accent);
-    transform: scale(0.97);
-    animation: pulse-bg 1.5s infinite;
 }
