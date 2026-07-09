@@ -10,7 +10,7 @@ autobins = false
 
 [dependencies]
 # Whisper speech recognition (optional, needs cmake)
-whisper-rs = { version = "0.15", optional = true }
+whisper-rs = { version = "0.16", optional = true }
 
 # Audio - WAV file handling (cross-platform)
 hound = "3.5"
