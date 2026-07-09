@@ -37,241 +37,212 @@
     </div>
 
     <div class="app">
-        <!-- Header with tabs -->
+        <!-- Header: logo/name/version on the left, connection badge + gear on the right -->
         <header class="header">
-            <h1>Voice Keyboard</h1>
-            <nav class="tabs">
-                <button class="tab active" type="button" data-tab="test">Status</button>
-                <button class="tab" type="button" data-tab="prompts">Controls</button>
-                <button class="tab" type="button" data-tab="settings">Settings</button>
-                <button class="tab" type="button" data-tab="log">Log</button>
-            </nav>
+            <img class="header-logo" src="app-icon.png" alt="Voice Keyboard" />
+            <div class="header-brand-text">
+                <h1>Voice Keyboard</h1>
+                <span class="header-version" id="header-version">…</span>
+            </div>
+            <div class="header-actions">
+                <span class="connection-badge state-connected" id="connection-badge">
+                    <span class="connection-badge-icon" id="connection-badge-icon">&#10003;</span>
+                    <span class="connection-badge-label" id="connection-badge-label">Connected</span>
+                </span>
+                <button class="icon-btn gear-btn" id="gear-btn" type="button" title="Settings">
+                    <span class="gear-icon">&#9881;</span>
+                </button>
+            </div>
         </header>
 
-        <!-- Status Tab (was Test) -->
-        <section id="test-tab" class="tab-content active">
-            <!-- Info Cards -->
-            <div class="test-info">
-                <div class="info-card">
-                    <span class="info-label">Connection</span>
-                    <span id="test-connection" class="info-value connected">Connected</span>
-                </div>
-                <div class="info-card">
-                    <span class="info-label">Mode</span>
-                    <span id="test-mode" class="info-value">OpenAI API</span>
-                </div>
-                <div class="info-card">
-                    <span class="info-label">Hotkey</span>
-                    <span id="test-hotkey" class="info-value"><kbd>Fn</kbd></span>
-                </div>
+        <!-- Main screen (replaces the old "Status" tab; now the only home screen) -->
+        <main class="main-screen">
+            <p class="record-instruction">Press and hold <kbd id="main-hotkey-name">Fn</kbd> to record and transcribe text into any application.</p>
+
+            <div class="record-circle-wrap">
+                <button class="record-circle state-idle" id="record-btn" type="button">
+                    <span class="record-circle-body">
+                        <span class="record-circle-ring"></span>
+                    </span>
+                    <span class="record-circle-label" id="record-btn-label">Hold <kbd>Fn</kbd></span>
+                </button>
             </div>
 
-            <!-- Hotkey State / Record Button -->
-            <button id="hotkey-state" class="hotkey-state idle record-test-btn" type="button">
-                <div class="hotkey-icon record-btn-icon">⏺</div>
-                <div class="hotkey-label record-btn-label">Press and hold <kbd>Fn</kbd> to record</div>
-            </button>
-
-            <!-- Result Area -->
             <div class="test-result">
-                <div id="test-result-text" class="test-result-text">
-                    <p class="placeholder">Transcription will appear here...</p>
+                <textarea id="test-result-text" class="test-result-text" placeholder="Transcription will appear here..."></textarea>
+                <p class="test-result-caption hidden" id="test-result-caption">Select text in any app, hold <kbd id="caption-hotkey-name">Fn</kbd>, and say how you'd like it changed — your selection is replaced right where it sits.</p>
+            </div>
+        </main>
+
+        <!-- Settings slide-over panel, opened via the gear icon -->
+        <div class="settings-overlay hidden" id="settings-overlay">
+            <div class="settings-panel">
+                <div class="settings-panel-header">
+                    <h2>Settings</h2>
+                    <button class="icon-btn settings-panel-close" id="settings-close-btn" type="button" title="Close">&#10005;</button>
                 </div>
-            </div>
-        </section>
+                <div class="settings-panel-body">
+                    <!-- Hotkey: moved here from the main screen, first thing users see -->
+                    <div class="settings-group">
+                        <h2>Hotkey</h2>
+                        <select id="hotkey-select" class="select">
+                            <option value="fn">Fn (Function/Globe)</option>
+                            <option value="ctrl">Left Control</option>
+                            <option value="ctrlright">Right Control</option>
+                            <option value="alt">Left Alt/Option</option>
+                            <option value="altright">Right Alt/Option</option>
+                            <option value="shift">Left Shift</option>
+                            <option value="cmd">Left Cmd/Meta</option>
+                        </select>
+                    </div>
 
-        <!-- Controls Tab (was Prompts) -->
-        <section id="prompts-tab" class="tab-content">
-            <div class="settings-group">
-                <h2>Hotkey</h2>
-                <select id="hotkey-select" class="select">
-                    <option value="fn">Fn (Function/Globe)</option>
-                    <option value="ctrl">Left Control</option>
-                    <option value="ctrlright">Right Control</option>
-                    <option value="alt">Left Alt/Option</option>
-                    <option value="altright">Right Alt/Option</option>
-                    <option value="shift">Left Shift</option>
-                    <option value="cmd">Left Cmd/Meta</option>
-                </select>
-            </div>
-
-            <div class="settings-group">
-                <h2>Enhance messages</h2>
-                <p class="field-note">GPT processes transcription with an enhance message before typing. Leave empty for plain transcription.</p>
-                <label class="field">
-                    <span class="field-label">Default Enhance message (Hotkey alone)</span>
-                    <textarea id="preprompt-default" class="input" rows="3" placeholder="e.g. Translate to English"></textarea>
-                </label>
-                <label class="field">
-                    <span class="field-label">Enhance message 1 (Hotkey + 1)</span>
-                    <textarea id="preprompt-1" class="input" rows="3" placeholder="e.g. Fix grammar and punctuation"></textarea>
-                </label>
-                <label class="field">
-                    <span class="field-label">Enhance message 2 (Hotkey + 2)</span>
-                    <textarea id="preprompt-2" class="input" rows="3" placeholder="e.g. Summarize in bullet points"></textarea>
-                </label>
-                <label class="field">
-                    <span class="field-label">Enhance message 3 (Hotkey + 3)</span>
-                    <textarea id="preprompt-3" class="input" rows="3" placeholder="e.g. Rewrite formally"></textarea>
-                </label>
-            </div>
-
-            <div class="settings-actions">
-                <button id="save-prompts" type="button" class="btn btn-primary">Save & Reload</button>
-            </div>
-        </section>
-
-        <!-- Settings Tab -->
-        <section id="settings-tab" class="tab-content">
-            <div class="app-info-header">
-                <img src="app-icon.png" alt="Voice Keyboard" class="app-logo" />
-                <div class="app-info-details">
-                    <h2 class="app-name">Voice Keyboard</h2>
-                    <span class="app-version" id="app-version">...</span>
-                    <button type="button" class="app-update-status" id="app-update-status"></button>
-                </div>
-                <div class="app-info-actions">
-                    <button id="check-update-btn" type="button" class="btn btn-secondary btn-small" onclick="checkForUpdate()">Check for updates</button>
-                    <a href="#" id="github-link" class="btn-link" onclick="openGitHub(); return false;">GitHub</a>
-                </div>
-            </div>
-
-            <div class="settings-group">
-                <h2>Transcription Mode</h2>
-                <div class="mode-selector">
-                    <label class="mode-card selected" data-mode="openai">
-                        <input type="radio" name="transcription-mode" value="openai" checked>
-                        <div class="mode-card-content">
-                            <div class="mode-card-title">OpenAI API</div>
-                            <div class="mode-card-desc">Cloud-based, best quality. Requires API key.</div>
+                    <!-- Version / update status -->
+                    <div class="app-info-header">
+                        <div class="app-info-status">
+                            <span class="app-version" id="app-version">...</span>
+                            <span class="app-update-status up-to-date" id="app-update-status">Up to date &#10003;</span>
                         </div>
-                    </label>
-                    <label class="mode-card" data-mode="local">
-                        <input type="radio" name="transcription-mode" value="local">
-                        <div class="mode-card-content">
-                            <div class="mode-card-title">Local Whisper</div>
-                            <div class="mode-card-desc">Offline, private. Requires model download.</div>
+                        <div class="app-info-actions">
+                            <button id="settings-update-btn" type="button" class="btn btn-small btn-update-orange hidden" onclick="showUpdateOverlay()">Update</button>
+                            <a href="#" id="github-link" class="btn-link" onclick="openGitHub(); return false;">GitHub</a>
                         </div>
-                    </label>
+                    </div>
+
+                    <div class="settings-group">
+                        <h2>Transcription Mode</h2>
+                        <div class="mode-selector">
+                            <label class="mode-card selected" data-mode="openai">
+                                <input type="radio" name="transcription-mode" value="openai" checked>
+                                <div class="mode-card-content">
+                                    <div class="mode-card-title">OpenAI API</div>
+                                    <div class="mode-card-desc">Cloud-based, best quality. Requires API key.</div>
+                                </div>
+                            </label>
+                            <label class="mode-card" data-mode="local">
+                                <input type="radio" name="transcription-mode" value="local">
+                                <div class="mode-card-content">
+                                    <div class="mode-card-title">Local Whisper</div>
+                                    <div class="mode-card-desc">Offline, private. Requires model download.</div>
+                                </div>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div id="openai-settings" class="settings-group">
+                        <h2>OpenAI</h2>
+                        <label class="field">
+                            <span class="field-label">API Key</span>
+                            <input id="openai-key" class="input" type="password" placeholder="sk-..." autocomplete="off">
+                            <span id="api-key-hint" class="api-key-hint" style="display:none"></span>
+                        </label>
+                        <label class="field">
+                            <span class="field-label">API URL</span>
+                            <input id="openai-url" class="input" type="text" placeholder="https://api.openai.com/v1">
+                        </label>
+                        <p class="field-note">Used for GPT-4o transcription in the background process.</p>
+                    </div>
+
+                    <div id="model-settings" class="settings-group hidden">
+                        <h2>Model</h2>
+                        <div id="models-list" class="models-list">
+                            <!-- Models loaded dynamically -->
+                        </div>
+                    </div>
+
+                    <div class="settings-group">
+                        <h2>Language</h2>
+                        <select id="language-select" class="select">
+                            <!-- Languages loaded dynamically -->
+                        </select>
+                    </div>
+
+                    <div class="settings-group">
+                        <h2>Input Method</h2>
+                        <select id="input-method-select" class="select">
+                            <option value="keyboard">Keyboard Simulation</option>
+                            <option value="clipboard">Clipboard + Paste</option>
+                        </select>
+                    </div>
+
+                    <div class="settings-group">
+                        <h2>Sound Feedback</h2>
+                        <label class="toggle-field">
+                            <span class="toggle-label">Play beep on recording stop</span>
+                            <input type="checkbox" id="sound-enabled" checked>
+                            <span class="toggle-switch"></span>
+                        </label>
+                    </div>
+
+                    <div class="settings-group">
+                        <h2>Microphone</h2>
+                        <select id="audio-device-select" class="select">
+                            <option value="">System Default</option>
+                            <!-- Devices loaded dynamically -->
+                        </select>
+                        <label class="toggle-field" style="margin-top:10px;">
+                            <span class="toggle-label">Lower volume during recording</span>
+                            <input type="checkbox" id="lower-volume" checked>
+                            <span class="toggle-switch"></span>
+                        </label>
+                    </div>
+
+                    <div class="settings-group">
+                        <h2>Recording</h2>
+                        <label class="field">
+                            <span class="field-label">Minimum duration (ms)</span>
+                            <input id="min-recording-ms" class="input" type="text" inputmode="numeric" pattern="[0-9]*" value="1000">
+                        </label>
+                        <p class="field-hint">Recordings shorter than this are ignored (avoids accidental taps).</p>
+                    </div>
+
+                    <div class="settings-actions">
+                        <button id="show-log-btn" type="button" class="log-disclosure">
+                            <span class="log-disclosure-chevron" id="log-disclosure-chevron">&#9656;</span>
+                            <span id="log-disclosure-label">Show Log</span>
+                        </button>
+                    </div>
+
+                    <!-- Log panel, revealed by clicking "Show Log" above -->
+                    <div class="log-panel-section hidden" id="log-panel-section">
+                        <div class="debug-toolbar">
+                            <div class="debug-filters">
+                                <label class="filter-chip active" data-filter="all">
+                                    <input type="checkbox" checked> All
+                                </label>
+                                <label class="filter-chip active" data-filter="system">
+                                    <input type="checkbox" checked> System
+                                </label>
+                                <label class="filter-chip active" data-filter="recording">
+                                    <input type="checkbox" checked> Recording
+                                </label>
+                                <label class="filter-chip active" data-filter="vad">
+                                    <input type="checkbox" checked> VAD
+                                </label>
+                                <label class="filter-chip active" data-filter="worker">
+                                    <input type="checkbox" checked> Worker
+                                </label>
+                                <label class="filter-chip active" data-filter="filter">
+                                    <input type="checkbox" checked> Filter
+                                </label>
+                                <label class="filter-chip active" data-filter="transcription">
+                                    <input type="checkbox" checked> Transcription
+                                </label>
+                                <label class="filter-chip active" data-filter="phrase">
+                                    <input type="checkbox" checked> Phrase
+                                </label>
+                                <label class="filter-chip active" data-filter="error">
+                                    <input type="checkbox" checked> Errors
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="debug-log-container">
+                            <div id="debug-log" class="debug-log"></div>
+                        </div>
+                    </div>
                 </div>
             </div>
-
-            <div id="openai-settings" class="settings-group">
-                <h2>OpenAI</h2>
-                <label class="field">
-                    <span class="field-label">API Key</span>
-                    <input id="openai-key" class="input" type="password" placeholder="sk-..." autocomplete="off">
-                    <span id="api-key-hint" class="api-key-hint" style="display:none"></span>
-                </label>
-                <label class="field">
-                    <span class="field-label">API URL</span>
-                    <input id="openai-url" class="input" type="text" placeholder="https://api.openai.com/v1">
-                </label>
-                <p class="field-note">Used for GPT-4o transcription in the background process.</p>
-            </div>
-
-            <div id="model-settings" class="settings-group hidden">
-                <h2>Model</h2>
-                <div id="models-list" class="models-list">
-                    <!-- Models loaded dynamically -->
-                </div>
-            </div>
-
-            <div class="settings-group">
-                <h2>Language</h2>
-                <select id="language-select" class="select">
-                    <!-- Languages loaded dynamically -->
-                </select>
-            </div>
-
-            <div class="settings-group">
-                <h2>Input Method</h2>
-                <select id="input-method-select" class="select">
-                    <option value="keyboard">Keyboard Simulation</option>
-                    <option value="clipboard">Clipboard + Paste</option>
-                </select>
-            </div>
-
-            <div class="settings-group">
-                <h2>Sound Feedback</h2>
-                <label class="toggle-field">
-                    <span class="toggle-label">Play beep on recording stop</span>
-                    <input type="checkbox" id="sound-enabled" checked>
-                    <span class="toggle-switch"></span>
-                </label>
-            </div>
-
-            <div class="settings-group">
-                <h2>Microphone</h2>
-                <select id="audio-device-select" class="select">
-                    <option value="">System Default</option>
-                    <!-- Devices loaded dynamically -->
-                </select>
-                <label class="toggle-field">
-                    <span class="toggle-label">Lower volume during recording</span>
-                    <input type="checkbox" id="lower-volume" checked>
-                    <span class="toggle-switch"></span>
-                </label>
-            </div>
-
-            <div class="settings-group">
-                <h2>Recording</h2>
-                <label class="field">
-                    <span class="field-label">Minimum duration (ms)</span>
-                    <input id="min-recording-ms" class="input" type="number" min="100" max="5000" step="100" value="1000">
-                </label>
-                <p class="field-note">Recordings shorter than this are ignored (avoids accidental taps).</p>
-            </div>
-
-            <div class="settings-actions">
-                <button id="save-settings" type="button" class="btn btn-primary">Save & Reload</button>
-            </div>
-        </section>
-
-        <!-- Log Tab (Debug) -->
-        <section id="log-tab" class="tab-content">
-            <div class="debug-toolbar">
-                <div class="debug-filters">
-                    <label class="filter-chip active" data-filter="all">
-                        <input type="checkbox" checked> All
-                    </label>
-                    <label class="filter-chip active" data-filter="system">
-                        <input type="checkbox" checked> System
-                    </label>
-                    <label class="filter-chip active" data-filter="recording">
-                        <input type="checkbox" checked> Recording
-                    </label>
-                    <label class="filter-chip active" data-filter="vad">
-                        <input type="checkbox" checked> VAD
-                    </label>
-                    <label class="filter-chip active" data-filter="worker">
-                        <input type="checkbox" checked> Worker
-                    </label>
-                    <label class="filter-chip active" data-filter="filter">
-                        <input type="checkbox" checked> Filter
-                    </label>
-                    <label class="filter-chip active" data-filter="transcription">
-                        <input type="checkbox" checked> Transcription
-                    </label>
-                    <label class="filter-chip active" data-filter="phrase">
-                        <input type="checkbox" checked> Phrase
-                    </label>
-                    <label class="filter-chip active" data-filter="error">
-                        <input type="checkbox" checked> Errors
-                    </label>
-                </div>
-                <div class="debug-actions">
-                    <label class="auto-scroll-toggle">
-                        <input type="checkbox" id="debug-autoscroll" checked> Auto-scroll
-                    </label>
-                    <button id="clear-debug" type="button" class="btn btn-secondary btn-small">Clear</button>
-                </div>
-            </div>
-
-            <div class="debug-log-container">
-                <div id="debug-log" class="debug-log"></div>
-            </div>
-        </section>
+        </div>
     </div>
 
     <!-- Permissions Modal -->

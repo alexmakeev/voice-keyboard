@@ -626,6 +626,14 @@ async fn open_github_issue(zip_path: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Open an arbitrary URL in the system's default browser.
+#[tauri::command]
+async fn open_url(url: String) -> Result<(), String> {
+    open::that(&url).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
 /// Check macOS permissions: microphone, accessibility.
 ///
 /// Accessibility is reported exclusively from the voice-typer sidecar's own
@@ -1820,9 +1828,18 @@ fn extract_status(line: &str) -> Option<(&'static str, String)> {
         return Some(("done", "Done".into()));
     }
     // Idle / ready signals (must check BEFORE "transcrib" — "to transcribe" appears in startup)
+    // "no voice detected" / "no audio captured" / "no speech detected" cover the
+    // silent-short-recording guard (see silent_short_recording_voice_percent() in
+    // voice_typer.rs) and the empty-transcription-result case: both are terminal
+    // outcomes for a recording that never reach a "] Done" line, so without matching
+    // them here the record circle in the UI gets stuck showing "Sending..." forever
+    // even though the backend has already finished and is back to waiting for input.
     if (lower.contains("hold") && lower.contains("to record"))
         || lower.contains("press ctrl+c")
         || lower.contains("recording too short")
+        || lower.contains("no voice detected")
+        || lower.contains("no audio captured")
+        || lower.contains("no speech detected")
         || lower.contains("testing connection")
     {
         return Some(("idle", "Ready".into()));
@@ -1939,8 +1956,23 @@ fn start_voice_typer(state: &AppState, app: &AppHandle) {
                                 let category = classify_line(&line);
                                 emit_debug_line(&app_h, &dl, &line, category);
 
-                                // Track transcription/improve blocks
-                                if line.starts_with("[TRANSCRIPTION") || line.starts_with("[IMPROVE MODE") || line.starts_with("[PREPROMPT") {
+                                // Track transcription blocks. NOTE: "[IMPROVE MODE" is
+                                // deliberately NOT included here. Unlike "[TRANSCRIPTION #N]",
+                                // its block does not open with a bare result line -- the very
+                                // next line is a debug preview banner ("Selected (N chars):
+                                // <preview>..."), i.e. a snippet of the SOURCE selection being
+                                // edited, not a transcription result. If treated as a block
+                                // start, that preview line (bare, no leading '[') would be
+                                // misread by extract_transcription_text() as real transcribed
+                                // text and pushed to the transcription list, overwriting the
+                                // UI's transcription display with selection metadata -- this
+                                // reproduced even when the selection targeted was inside the
+                                // app's own transcription textarea. IMPROVE MODE's actual
+                                // content (spoken instruction, improved result) is always
+                                // printed on bracket-prefixed lines, which extract_transcription_text
+                                // already ignores regardless of in_transcription_block, so
+                                // omitting it from this trigger loses no real functionality.
+                                if line.starts_with("[TRANSCRIPTION") || line.starts_with("[PREPROMPT") {
                                     in_transcription_block = true;
                                     continue;
                                 }
@@ -2151,10 +2183,10 @@ fn main() {
             }
 
             // Create tray menu
-            let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
+            let open = MenuItem::with_id(app, "open", "Open", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
-            let menu = Menu::with_items(app, &[&settings, &quit])?;
+            let menu = Menu::with_items(app, &[&open, &quit])?;
 
             // Create tray icon — decode PNG to raw RGBA
             let tray_png = image::load_from_memory(include_bytes!("../icons/tray-icon.png"))
@@ -2169,11 +2201,14 @@ fn main() {
                 .show_menu_on_left_click(cfg!(target_os = "macos")) // macOS: left click = menu; Windows: right click = menu (default)
                 .on_menu_event(|app, event| {
                     match event.id.as_ref() {
-                        "settings" => {
+                        "open" => {
                             if let Some(window) = app.get_webview_window("main") {
                                 let _ = window.show();
                                 let _ = window.set_focus();
-                                let _ = window.emit("navigate", "settings");
+                                // Ensure the window comes up on the default home
+                                // screen, not left showing the Settings panel
+                                // from a previous session.
+                                let _ = window.emit("close-settings", ());
                             }
                         }
                         "quit" => {
@@ -2194,7 +2229,7 @@ fn main() {
                             if let Some(window) = app.get_webview_window("main") {
                                 let _ = window.show();
                                 let _ = window.set_focus();
-                                let _ = window.emit("navigate", "settings");
+                                let _ = window.emit("open-settings", ());
                             }
                         }
                     }
@@ -2222,6 +2257,7 @@ fn main() {
             delete_model,
             create_debug_report,
             open_github_issue,
+            open_url,
             check_permissions,
             request_microphone_permission,
             request_permissions,
