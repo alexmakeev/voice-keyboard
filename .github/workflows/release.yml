@@ -66,7 +66,7 @@ jobs:
           Compress-Archive -Path "dist/*" -DestinationPath "voice-typer-x86_64-pc-windows-msvc.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: voice-typer-x86_64-pc-windows-msvc
           path: voice-typer-x86_64-pc-windows-msvc.zip
@@ -105,7 +105,7 @@ jobs:
         run: cargo tauri build --target x86_64-pc-windows-msvc
 
       - name: Upload NSIS installer
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: voice-keyboard-windows-x64-setup
           path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
@@ -147,7 +147,7 @@ jobs:
         run: cargo tauri build --features macos-private-api
 
       - name: Upload DMG
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: voice-keyboard-macos-dmg
           path: src-tauri/target/release/bundle/dmg/*.dmg
@@ -441,7 +441,7 @@ jobs:
           rm -f $RUNNER_TEMP/certificate.p12 $RUNNER_TEMP/AuthKey.p8
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-${{ matrix.arch }}
           path: dist/*
