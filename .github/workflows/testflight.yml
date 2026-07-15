@@ -137,13 +137,26 @@ jobs:
               || /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string icon" "$PLIST"; echo "added icon.icns"; fi
           # 3) unique build number
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" "$PLIST" || true
-          # 4) embed provisioning profile + re-sign for App Store
+          # 4) sidecar entitlements WITHOUT application-identifier (fix 90885)
+          cat > src-tauri/entitlements.sidecar.plist <<'SP'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>com.apple.security.app-sandbox</key><true/>
+            <key>com.apple.security.inherit</key><true/>
+          </dict></plist>
+          SP
+          # 5) embed profile (main app only) + sign INSIDE-OUT (no --deep, so sidecar keeps its own entitlements)
           cp "$RUNNER_TEMP/embedded.provisionprofile" "$APP/Contents/embedded.provisionprofile"
+          while IFS= read -r f; do
+            if file "$f" | grep -q "Mach-O"; then codesign --force --sign "$DIST_IDENTITY" "$f" || true; fi
+          done < <(find "$APP/Contents/Frameworks" "$APP/Contents/Resources" -type f 2>/dev/null)
           SIDECAR="$APP/Contents/MacOS/voice-typer"
-          [ -f "$SIDECAR" ] && codesign --force --sign "$DIST_IDENTITY" --entitlements src-tauri/entitlements.appstore.plist "$SIDECAR" || true
-          codesign --force --deep --sign "$DIST_IDENTITY" --entitlements src-tauri/entitlements.appstore.plist "$APP"
-          codesign --verify --deep --strict "$APP" || true
-          echo "=== effective entitlements ==="; codesign -d --entitlements - "$APP" || true
+          [ -f "$SIDECAR" ] && codesign --force --sign "$DIST_IDENTITY" --entitlements src-tauri/entitlements.sidecar.plist "$SIDECAR"
+          codesign --force --sign "$DIST_IDENTITY" --entitlements src-tauri/entitlements.appstore.plist "$APP"
+          codesign --verify --strict "$APP" || true
+          echo "=== app entitlements ==="; codesign -d --entitlements - "$APP" || true
+          echo "=== sidecar entitlements ==="; codesign -d --entitlements - "$SIDECAR" || true
 
       - name: Build signed .pkg
         run: |
